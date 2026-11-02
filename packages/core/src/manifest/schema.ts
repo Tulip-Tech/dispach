@@ -648,7 +648,8 @@ export const TeamSchema = z
     .strict()
 
 /**
- * A throwaway child of this agent that runs a routed tool call in a context of its own (pilot.6).
+ * A throwaway child of this agent that runs a routed tool call in a context of its own (pilot.6), or a
+ * task the model hands it with `delegate` when it declares `spawn: true` (decision 15.20).
  *
  * Routing is the harness's decision, never the model's: when the parent calls a slug under
  * `route.tools`, the policy and the write gate decide as they always do, and only then does the child
@@ -664,7 +665,17 @@ export const SubagentSchema = z
         /** What the child is for. Rendered into its task ahead of the call it was handed. */
         task: z.string().min(1),
         tools: z.array(z.string().min(1)).min(1),
-        route: z.object({ tools: z.array(z.string().min(1)).min(1) }).strict(),
+        /** The slugs whose calls run this child. Optional when `spawn` is set; one of the two is required. */
+        route: z
+            .object({ tools: z.array(z.string().min(1)).min(1) })
+            .strict()
+            .optional(),
+        /**
+         * The model may start this child itself, with `delegate` (`docs/25-SPEC-FAN-OUT.md`, decision
+         * 15.20). Opt-in per child: routing stays the harness's decision for every child that does not
+         * say so.
+         */
+        spawn: z.boolean().default(false),
         /** The artifact's schema. Absent: `{summary}`. */
         artifact: TeamMemberSchema.shape.artifact.optional(),
         /** A model role for this child. Absent: `model.subagent` when declared, else `main`. */
@@ -673,7 +684,7 @@ export const SubagentSchema = z
         maxSteps: z.number().int().positive().optional(),
         /**
          * The routed call's bound in milliseconds, in place of `limits.toolTimeoutMs` for this child's
-         * `route.tools` only (pilot.15). A child reading fifteen messages one call at a time needs
+         * `route.tools` (pilot.15), and the bound on each `delegate` task this child runs. A child reading fifteen messages one call at a time needs
          * longer than one tool should be given, and raising the tool bound would raise it for `exec`
          * too. The child is still ended a second before it, so it reports a timeout.
          */

@@ -222,6 +222,10 @@ export interface EventDataMap {
         name?: string
         /** The parent's tool call this delegation answers. */
         callId?: string
+        /** A `delegate` task's position in its call, from 0. Absent for a routed call or a handoff. */
+        index?: number
+        /** The label the model gave a `delegate` task. */
+        label?: string
     }
     /**
      * How it ended. `outcome` rather than a boolean, and that is the same reasoning
@@ -238,6 +242,8 @@ export interface EventDataMap {
         kind: "member" | "self"
         name?: string
         callId?: string
+        index?: number
+        label?: string
         outcome: "ok" | "no_artifact" | "budget" | "error"
         steps: number
         tokens: { prompt: number; output: number }
@@ -328,6 +334,18 @@ export interface EventDataMap {
      * `warning` carries the sentence saying so.
      */
     "context.reset": { count: number; warning?: string }
+    /**
+     * A session's checkpoint was written (decision 15.21): by `POST …/sessions/:key/compact`, or after a
+     * turn whose `reset` fired. `before` and `after` are the estimated tokens a turn would start from.
+     * Its own type rather than a `compaction.stage` member, so a client's switch over that union keeps
+     * compiling.
+     */
+    "session.compacted": {
+        before: number
+        after: number
+        digest: "model" | "mechanical"
+        keptTurns: number
+    }
     /**
      * The session moved to another phase, and the visible catalogue changed with it.
      *
@@ -773,6 +791,7 @@ export const EVENT_TYPES = [
     "context.pressure",
     "compaction.stage",
     "context.reset",
+    "session.compacted",
     "phase.changed",
     "model.call",
     "model.chunk",
