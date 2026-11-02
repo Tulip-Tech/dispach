@@ -566,6 +566,19 @@ describe("session controls", () => {
         expect(render({ session: { recall: false } })).toContain("recall: off")
     })
 
+    test("compact appears when it can be done, and says when it last was", () => {
+        expect(render({ session: {} })).not.toContain(">compact<")
+        const html = render({ session: {}, onCompact: () => undefined })
+        expect(html).toContain(">compact<")
+        expect(html).toContain("keeping the last two")
+        expect(
+            render({
+                session: { compactedAt: "2026-11-02T10:00:00Z" },
+                onCompact: () => undefined,
+            }),
+        ).toContain("Last compacted 2026-11-02T10:00:00Z")
+    })
+
     test("a phase picker only on an agent with phases, on the session's phase", () => {
         expect(render({ session: {} })).not.toContain("<select")
         const html = render({ session: { phase: "build" }, phases: ["triage", "build"] })

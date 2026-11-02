@@ -19,6 +19,12 @@ import { basename, isAbsolute, join, resolve } from "node:path"
 import type { InboundAudio } from "../channels/channel.ts"
 import { assembleContext, historyReport, slotReport } from "../context/assemble.ts"
 import { type Calibration, observationBudget, UNCALIBRATED } from "../context/budget.ts"
+import {
+    checkpointMessages,
+    historyTokens,
+    isTurnStart,
+    mechanicalDigest,
+} from "../context/compaction/stages.ts"
 import { renderCompactionNotice } from "../context/compaction-notice.ts"
 import { renderConfigSummary } from "../context/config-summary.ts"
 import { estimateMessageTokens } from "../context/tokens.ts"
@@ -37,6 +43,7 @@ import {
     privateMemoryRefused,
     scheduleToolUnknown,
     sessionsScopeUnassigned,
+    sessionTooShort,
     tokenBudgetExhausted,
     toolGatedAfterFirstUse,
     turnsAtCapacity,
@@ -44,7 +51,7 @@ import {
     workspaceReloadRefused,
 } from "../errors.ts"
 import type { EventBus } from "../events/bus.ts"
-import { newCallId, newTurnId } from "../loop/ids.ts"
+import { newCallId, newRunId, newTurnId } from "../loop/ids.ts"
 import { entryPhase, isPhased, unmatchedAllows, unmatchedEntries } from "../loop/phases.ts"
 import {
     type ActingParticipant,
@@ -115,9 +122,11 @@ import {
     type MessageReach,
     type SessionSummary,
     type Store,
+    type StoredMessage,
     type TurnRecord,
 } from "../store/store.ts"
 import { ASK_AGENT } from "../team/ask.ts"
+import { DELEGATE, delegateTool } from "../team/delegate.ts"
 import { routedTool, type SubagentRunner } from "../team/subagents.ts"
 import { HANDOFF } from "../team/supervisor.ts"
 import { type DialectId, passThroughFilter, type StreamFilter } from "../tools/dialect/dialect.ts"
@@ -355,6 +364,31 @@ const CHILD_OBSERVATION_SHARE = 0.75
 
 /** A routed call's child is ended this long before the executor would abandon the call. */
 const SUBAGENT_DEADLINE_MARGIN_MS = 1000
+
+/** Turns kept verbatim by a checkpoint: the current exchange and the one it answers, like `collapse`. */
+const CHECKPOINT_KEEP_TURNS = 2
+
+/** What `compactSession` did, as `POST …/sessions/:key/compact` answers it. */
+export interface CompactedSession {
+    readonly sessionKey: string
+    /** Estimated tokens of the history a turn would start from, before and after. */
+    readonly before: number
+    readonly after: number
+    readonly digest: "model" | "mechanical"
+    readonly keptTurns: number
+}
+
+/** A stored message as a prompt wants it: the store's bookkeeping dropped. */
+function chatOf(message: StoredMessage): ChatMessage {
+    return {
+        role: message.role,
+        content: message.content,
+        ...(message.toolCalls === undefined ? {} : { toolCalls: message.toolCalls }),
+        ...(message.toolCallId === undefined ? {} : { toolCallId: message.toolCallId }),
+        ...(message.origin === undefined ? {} : { origin: message.origin }),
+        ...(message.tainted === true ? { tainted: true } : {}),
+    }
+}
 
 /** What only a subagent's turn carries. Private to this module: `send` never accepts it. */
 interface ChildTurn {
@@ -619,7 +653,28 @@ export class Agent {
         ]
         this.#bus = init.bus
         this.store = init.store
-        this.tools = init.tools
+        // `delegate` joins the catalogue here, at load, so slot 1 renders it once like every other
+        // tool (decision 15.20). Only when a child says `spawn: true`, and only onto a catalogue that
+        // exists: a child's tools must be pinned, so a tool-less agent has no children to start.
+        const spawned = (this.manifest.subagents ?? []).filter((child) => child.spawn)
+        this.tools =
+            spawned.length === 0 || init.tools.size === 0
+                ? init.tools
+                : init.tools.withTools([
+                      delegateTool({
+                          children: spawned,
+                          mutates: (child) =>
+                              child.tools.some(
+                                  (slug) =>
+                                      !init.tools.has(slug) ||
+                                      init.tools.resolve(slug).spec.mutating,
+                              ),
+                          runner: this.#subagent,
+                          bus: init.bus,
+                          store: init.store.handoffs,
+                          maxParallel: this.manifest.limits.maxParallelTools,
+                      }),
+                  ])
         this.knowledge = init.knowledge
         this.skills = init.skills
         this.#scriptRunner = init.scriptRunner
@@ -699,7 +754,7 @@ export class Agent {
             this.manifest.tools.eventDetail === "redacted"
                 ? eventDetail(init.loaded.env)
                 : undefined
-        if (init.tools.size === 0) {
+        if (this.tools.size === 0) {
             this.#checkScheduleAllows([])
             this.#toolRuntime = undefined
             // No catalogue, so nothing in slot 1 — kept that way. But a turn can still bring its own
@@ -708,7 +763,7 @@ export class Agent {
             // delegation to one failed as "finished without returning an answer". Found by running a
             // cross-member delegation in the image. This runtime is used only for such a turn.
             this.#bareToolRuntime = {
-                registry: init.tools,
+                registry: this.tools,
                 dialect,
                 dir: init.loaded.dir,
                 blocks: [],
@@ -723,16 +778,21 @@ export class Agent {
                 ...(detail === undefined ? {} : { eventDetail: detail }),
             }
         } else {
-            const specs = init.tools.specs()
+            const specs = this.tools.specs()
+            const bounds = spawned.map(
+                (child) => child.timeoutMs ?? this.manifest.limits.toolTimeoutMs,
+            )
+            const delegateBound =
+                this.tools.has(DELEGATE) && bounds.length > 0 ? Math.max(...bounds) : undefined
             const requestTools = dialect.requestTools(specs)
             this.#toolRuntime = {
-                registry: init.tools,
+                registry: this.tools,
                 dialect,
                 dir: init.loaded.dir,
                 // The catalogue *and* what was left out of it. Both are settled at load, so both
                 // belong to the cache-stable prefix; passing `notEnabled` per turn would be the one
                 // way to make slot 1 vary and quietly stop prompt caching.
-                blocks: dialect.renderCatalogue(specs, init.tools.notEnabled),
+                blocks: dialect.renderCatalogue(specs, this.tools.notEnabled),
                 ...(target === undefined ? {} : { writeTarget: target }),
                 ...(this.#memory === undefined ? {} : { memoryDir: this.#memory.dir }),
                 ...(requestTools === undefined ? {} : { requestTools }),
@@ -749,6 +809,11 @@ export class Agent {
                 // `onNoApprover` matters.
                 policy: this.manifest.tools.policy,
                 ...(init.approve === undefined ? {} : { approve: init.approve }),
+                // A `delegate` call runs whole subagent turns, so it is bounded by the longest bound
+                // a spawnable child declares rather than by one tool call's (`25-SPEC-FAN-OUT.md`).
+                ...(delegateBound === undefined
+                    ? {}
+                    : { timeoutFor: new Map([[DELEGATE, delegateBound]]) }),
             }
 
             // Said at load, where it can be fixed. Without it, an agent pinning `exec` runs one
@@ -1107,18 +1172,25 @@ export class Agent {
         if (base === undefined || children.length === 0) return base
         if (this.#routedToolRuntime !== undefined) return this.#routedToolRuntime
         const byRoute = new Map(
-            children.flatMap((child) => child.route.tools.map((slug) => [slug, child] as const)),
+            children.flatMap(
+                (child) => child.route?.tools.map((slug) => [slug, child] as const) ?? [],
+            ),
         )
         const timeoutFor = new Map(
             children.flatMap((child) =>
                 child.timeoutMs === undefined
                     ? []
-                    : child.route.tools.map((slug) => [slug, child.timeoutMs as number] as const),
+                    : (child.route?.tools ?? []).map(
+                          (slug) => [slug, child.timeoutMs as number] as const,
+                      ),
             ),
         )
         this.#routedToolRuntime = {
             ...base,
-            ...(timeoutFor.size === 0 ? {} : { timeoutFor }),
+            // Merged, not replaced: the base carries `delegate`'s bound.
+            ...(timeoutFor.size === 0
+                ? {}
+                : { timeoutFor: new Map([...(base.timeoutFor ?? []), ...timeoutFor]) }),
             registry: base.registry.withSwapped((tool) => {
                 const child = byRoute.get(tool.spec.slug)
                 return child === undefined
@@ -1634,7 +1706,7 @@ export class Agent {
         this.#refreshVolatile()
 
         await this.store.sessions.ensure(this.id, sessionKey)
-        const history = await this.store.messages.history(this.id, sessionKey)
+        const history = await this.#promptHistory(sessionKey)
 
         const actingId = (options.participant ?? participantOf(options.from))?.id
         await this.store.turns.start({
@@ -1917,8 +1989,128 @@ export class Agent {
         await this.#redactForgetConversation(sessionKey, turnId)
         await this.#indexHistory()
 
+        // `reset` replaced this session's history with a digest. Saved, so the next turn starts from it
+        // instead of re-running the whole ladder and re-paying the digest (decision 15.21). Already
+        // inside this key's lock, so it calls the work directly; a failure costs only the saving.
+        if (result.resets !== undefined && result.resets > 0) {
+            // One turn kept, not two: `reset` fired because the last two did not fit, and it kept only
+            // this one. Keeping two would leave the next turn over `reset` again.
+            await this.#checkpoint(sessionKey, { keepTurns: 1, turnId }).catch((error: unknown) => {
+                if (isHarnessError(error) && error.code === "session_too_short") return
+                this.#bus.emit(
+                    "agent.warning",
+                    {
+                        code: "session_checkpoint_failed",
+                        message: `Saving the compacted conversation failed: ${error instanceof Error ? error.message : String(error)}`,
+                        hint: "The reply was delivered. The next turn compacts the whole history again, as it did before checkpoints existed.",
+                    },
+                    { agentId: this.id, sessionKey },
+                )
+            })
+        }
+
         this.#reportManifestChange()
         return { ...result, sessionKey }
+    }
+
+    /**
+     * What a turn starts from: the session's checkpoint and every message after it, or the whole
+     * stored history when it was never compacted (decision 15.21). The store keeps every message either
+     * way; `history()` still reads them all, for a screen.
+     */
+    async #promptHistory(sessionKey: string): Promise<readonly ChatMessage[]> {
+        const checkpoint = await this.store.sessions.checkpoint(this.id, sessionKey)
+        if (checkpoint === undefined) return this.store.messages.history(this.id, sessionKey)
+        const after = await this.store.messages.historySince(
+            this.id,
+            sessionKey,
+            checkpoint.throughId,
+        )
+        return [...checkpoint.messages, ...after.map(chatOf)]
+    }
+
+    /**
+     * Compact a conversation now (decision 15.21, \`POST …/sessions/:key/compact\`): everything before
+     * its last \`keepTurns\` turns becomes a digest and the person's requests, saved as the session's
+     * checkpoint. Waits for a running turn in that session, and never runs beside one.
+     */
+    async compactSession(
+        sessionKey: string,
+        options: { readonly keepTurns?: number; readonly signal?: AbortSignal } = {},
+    ): Promise<CompactedSession> {
+        return this.#serialised(sessionKey, () =>
+            this.#checkpoint(sessionKey, {
+                keepTurns: options.keepTurns ?? CHECKPOINT_KEEP_TURNS,
+                turnId: `compact:${newRunId()}`,
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
+            }),
+        )
+    }
+
+    /** The work of `compactSession`, for a caller already holding the session's lock. */
+    async #checkpoint(
+        sessionKey: string,
+        options: {
+            readonly keepTurns: number
+            readonly turnId: string
+            readonly signal?: AbortSignal
+        },
+    ): Promise<CompactedSession> {
+        const keep = Math.max(1, Math.floor(options.keepTurns))
+        const previous = await this.store.sessions.checkpoint(this.id, sessionKey)
+        const stored = await this.store.messages.historySince(
+            this.id,
+            sessionKey,
+            previous?.throughId ?? 0,
+        )
+        const starts = stored.flatMap((message, index) =>
+            isTurnStart(chatOf(message)) ? [index] : [],
+        )
+        const cut = starts.length > keep ? (starts[starts.length - keep] ?? 0) : 0
+        const covered = stored.slice(0, cut)
+        const last = covered.at(-1)
+        if (last === undefined) throw sessionTooShort(sessionKey, starts.length, keep)
+        const kept = stored.slice(cut).map(chatOf)
+        const span = [...(previous?.messages ?? []), ...covered.map(chatOf)]
+
+        const meter = this.#meter(sessionKey, options.turnId, undefined)
+        const summarise = this.#compaction(sessionKey, meter).summarise
+        let text = ""
+        let digest: "model" | "mechanical" = "mechanical"
+        if (summarise !== undefined) {
+            try {
+                text = (
+                    await summarise(span, options.signal ?? new AbortController().signal)
+                ).trim()
+                if (text !== "") digest = "model"
+            } catch {
+                // The ladder's rule (`digestFor`): a thinner digest beats a failed compaction, and
+                // `digest: "mechanical"` on the event says it happened.
+            }
+        }
+        // Without the earlier digest: the mechanical one counts the person's messages and quotes the
+        // first, and a digest is the runtime's text, not theirs.
+        if (digest === "mechanical") {
+            text = mechanicalDigest(span.filter((message) => message.origin !== "digest"))
+        }
+
+        const messages = checkpointMessages(span, text)
+        const before = historyTokens([...span, ...kept])
+        const after = historyTokens([...messages, ...kept])
+        await this.store.sessions.setCheckpoint(this.id, sessionKey, {
+            throughId: last.id,
+            messages,
+            digest,
+            tokensBefore: before,
+            tokensAfter: after,
+            createdAt: new Date().toISOString(),
+        })
+        this.#bus.emit(
+            "session.compacted",
+            { before, after, digest, keptTurns: keep },
+            { agentId: this.id, sessionKey },
+        )
+        return { sessionKey, before, after, digest, keptTurns: keep }
     }
 
     /** Turns in a session that listed or deleted with `memory_forget`, until a deletion lands. */
@@ -2114,7 +2306,7 @@ export class Agent {
         const input = options.input ?? ""
         // The same refresh `send` performs, or the preview would describe slot 4 as it was at boot.
         this.#refreshVolatile()
-        const history = await this.store.messages.history(this.id, sessionKey)
+        const history = await this.#promptHistory(sessionKey)
         const active =
             this.knowledge === undefined || input === ""
                 ? []

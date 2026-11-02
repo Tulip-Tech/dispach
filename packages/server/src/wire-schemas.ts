@@ -342,6 +342,16 @@ export const PhaseBody = z.object({
     }),
 })
 
+/** `POST /v1/agents/:id/sessions/:key/compact` (decision 15.21) */
+export const CompactBody = z.object({
+    keepTurns: refuse(z.number().int().min(1).optional(), {
+        code: "compact_keep_invalid",
+        hint: 'Send { "keepTurns": 2 }, a whole number of at least 1, or omit it to keep the last 2 turns verbatim.',
+        description:
+            "How many of the newest turns stay verbatim. Everything before them becomes a digest and the person's requests. Default 2.",
+    }),
+})
+
 /** `POST /v1/agents/:id/sessions/:key/recall` (pilot.10) */
 export const RecallBody = z.object({
     recall: refuse(z.boolean(), {
@@ -568,6 +578,16 @@ export const ConversationMessageBody = z.object({
         hint: "Who said it. A key bound to a participant fills this in and may name no one else; an unbound key must name the author.",
         description: "The human member who said it. Filled in from a participant-bound key.",
     }),
+})
+
+/** `POST /v1/agents/:id/sessions/resolve`: the key a message would name, and who it is from. */
+export const ResolveBody = z.object({
+    sessionKey: refuse(z.string().min(1), {
+        code: "session_key_required",
+        hint: 'Send { "sessionKey": "local:abc123" }: the key a message would name.',
+        description: "The key a message would carry as its sessionKey.",
+    }),
+    from: SenderSchema.optional(),
 })
 
 /** `POST /v1/agents/:id/sessions/rotate`. Empty is the caller themselves (or the operator). */

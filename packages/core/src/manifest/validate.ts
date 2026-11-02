@@ -781,7 +781,16 @@ export function validateSubagents(manifest: AgentManifest): ErrorDetail[] {
             })
         }
 
-        for (const slug of child.route.tools) {
+        if (child.route === undefined && !child.spawn) {
+            found.push({
+                code: "subagent_unreachable",
+                message: `Subagent "${child.name}" declares neither route nor spawn, so nothing can start it.`,
+                hint: `Add route: {tools: [<slug>]} to run it for those calls, or spawn: true to let the model start it with delegate.`,
+                field,
+            })
+        }
+
+        for (const slug of child.route?.tools ?? []) {
             if (!child.tools.includes(slug)) {
                 found.push({
                     code: "subagent_route_outside_tools",

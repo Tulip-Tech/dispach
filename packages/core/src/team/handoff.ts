@@ -139,11 +139,16 @@ export async function runHandoff(init: {
     readonly kind?: "member" | "self"
     readonly name?: string
     readonly callId?: string
+    /** A `delegate` task's position in its call, and the label the model gave it (`25-SPEC-FAN-OUT.md`). */
+    readonly index?: number
+    readonly label?: string
 }): Promise<HandoffOutcome> {
     const link = {
         kind: init.kind ?? "member",
         ...(init.name === undefined ? {} : { name: init.name }),
         ...(init.callId === undefined ? {} : { callId: init.callId }),
+        ...(init.index === undefined ? {} : { index: init.index }),
+        ...(init.label === undefined ? {} : { label: init.label }),
     }
     const now = init.now ?? (() => new Date())
     const handoffId = newHandoffId()

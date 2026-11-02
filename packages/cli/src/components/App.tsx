@@ -837,7 +837,9 @@ export function App({
                 // A subagent's calls fold under the same key, and they are there whether or not this
                 // model streams reasoning, so they are checked first: refusing ⌥r for "reasoning is
                 // off" with a folded subagent on screen would be the dead key again.
-                const subagents = state.items.some((item) => (item.subagent?.lines.length ?? 0) > 0)
+                const subagents = state.items.some((item) =>
+                    (item.subagents ?? []).some((view) => view.lines.length > 0),
+                )
                 if (!subagents && !showReasoning) {
                     note(
                         "reasoning is off: either this model does not stream it, or --no-reasoning is set",

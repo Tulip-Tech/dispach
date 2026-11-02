@@ -172,33 +172,48 @@ function applyDelta(
     }
 }
 
-/** The tool row `match` picks, with its subagent replaced. Unchanged state when no row matches. */
+/**
+ * The tool row `match` picks, with its subagent for `sessionKey` changed or added. Unchanged state
+ * when no row matches or `change` declines.
+ */
 function withSubagent(
     state: TranscriptState,
     match: (item: TranscriptItem) => boolean,
-    change: (view: SubagentView | undefined, item: TranscriptItem) => SubagentView | undefined,
+    sessionKey: string,
+    change: (view: SubagentView | undefined) => SubagentView | undefined,
 ): TranscriptState {
     const at = state.items.findIndex(match)
     if (at === -1) return state
     const items = [...state.items]
     const item = items[at] as TranscriptItem
-    const view = change(item.subagent, item)
+    const views = item.subagents ?? []
+    const index = views.findIndex((view) => view.sessionKey === sessionKey)
+    const view = change(index === -1 ? undefined : views[index])
     if (view === undefined) return state
-    items[at] = { ...item, subagent: view }
+    const next =
+        index === -1
+            ? [...views, view].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+            : views.map((existing, i) => (i === index ? view : existing))
+    items[at] = { ...item, subagents: next }
     return { ...state, items }
 }
+
+/** The row holding the subagent whose session is `sessionKey`. */
+const holds = (sessionKey: string) => (item: TranscriptItem) =>
+    item.subagents?.some((view) => view.sessionKey === sessionKey) === true
 
 /**
  * A subagent's own event: its tool calls become lines under the routed call's row. Its text and
  * turn events stay out of the conversation, which is the parent's; `handoff.result` reports the end.
  */
 function reduceChild(state: TranscriptState, event: AnyEvent): TranscriptState {
-    const mine = (item: TranscriptItem) => item.subagent?.sessionKey === event.sessionKey
+    const key = event.sessionKey ?? ""
+    const mine = holds(key)
     // The child's return channel is how it hands back its answer, not work it did for the person.
     if ("slug" in event.data && event.data.slug === SUBMIT_ARTIFACT) return state
     switch (event.type) {
         case "tool.call":
-            return withSubagent(state, mine, (view) =>
+            return withSubagent(state, mine, key, (view) =>
                 view === undefined
                     ? undefined
                     : {
@@ -212,7 +227,7 @@ function reduceChild(state: TranscriptState, event: AnyEvent): TranscriptState {
         case "tool.result": {
             const { slug, callId, ok, latencyMs } = event.data
             const text = `${slug} — ${ok ? "ok" : "failed"} · ${latencyMs} ms`
-            return withSubagent(state, mine, (view) =>
+            return withSubagent(state, mine, key, (view) =>
                 view === undefined
                     ? undefined
                     : {
@@ -226,7 +241,7 @@ function reduceChild(state: TranscriptState, event: AnyEvent): TranscriptState {
             )
         }
         case "tool.gated":
-            return withSubagent(state, mine, (view) =>
+            return withSubagent(state, mine, key, (view) =>
                 view === undefined
                     ? undefined
                     : {
@@ -246,22 +261,28 @@ function reduceEvent(state: TranscriptState, event: AnyEvent): TranscriptState {
     if (event.parentTurnId !== undefined) return reduceChild(state, event)
     switch (event.type) {
         case "handoff.start": {
-            const { kind, name, callId, sessionKey } = event.data
+            const { kind, name, callId, sessionKey, label, index } = event.data
             if (kind !== "self" || callId === undefined) return state
             return withSubagent(
                 state,
                 (item) => item.callId === callId,
-                () => ({ name: name ?? "subagent", sessionKey, lines: [] }),
+                sessionKey,
+                (view) =>
+                    view ?? {
+                        name: name ?? "subagent",
+                        sessionKey,
+                        lines: [],
+                        ...(label === undefined ? {} : { label }),
+                        ...(index === undefined ? {} : { index }),
+                    },
             )
         }
 
         case "handoff.result": {
             const { sessionKey, steps, tokens, outcome } = event.data
             const summary = `${steps} step${steps === 1 ? "" : "s"} · ${compactTokens(tokens.prompt + tokens.output)} tokens · ${outcome === "ok" ? "ok" : outcome.replace("_", " ")}`
-            return withSubagent(
-                state,
-                (item) => item.subagent?.sessionKey === sessionKey,
-                (view) => (view === undefined ? undefined : { ...view, summary }),
+            return withSubagent(state, holds(sessionKey), sessionKey, (view) =>
+                view === undefined ? undefined : { ...view, summary },
             )
         }
 
@@ -316,8 +337,8 @@ function reduceEvent(state: TranscriptState, event: AnyEvent): TranscriptState {
                 role: ok ? "tool" : "error",
                 text,
                 callId,
-                // The routed call's block outlives its own completion: the child's lines are the point.
-                ...(item.subagent === undefined ? {} : { subagent: item.subagent }),
+                // The call's blocks outlive its own completion: the children's lines are the point.
+                ...(item.subagents === undefined ? {} : { subagents: item.subagents }),
             }
             return { ...state, items }
         }
@@ -674,23 +695,23 @@ export function transcriptRows(
             })
         }
 
-        if (item.subagent !== undefined) {
+        for (const [b, view] of (item.subagents ?? []).entries()) {
             // Folded with the reasoning blocks, by the same key: both are the detail behind a row, and
             // the reply is what a person reads first.
-            const view = item.subagent
             const open = options.expandReasoning === true
             const status = view.summary ?? "running"
             const more =
                 !open && view.lines.length > 0
                     ? ` · ⌥r shows ${view.lines.length} call${view.lines.length === 1 ? "" : "s"}`
                     : ""
+            const label = view.label === undefined ? "" : ` · ${view.label}`
             for (const [n, line] of wrapText(
-                `↳ subagent ${view.name} · ${status}${more}`,
+                `↳ subagent ${view.name}${label} · ${status}${more}`,
                 Math.max(1, options.columns - pad.length),
             ).entries()) {
                 rows.push(
                     chrome({
-                        key: `${item.id}:sub-${n}`,
+                        key: `${item.id}:sub${b}-${n}`,
                         role: item.role,
                         text: `${pad}${line}`,
                         dim: true,
@@ -705,7 +726,7 @@ export function transcriptRows(
                         Math.max(1, options.columns - inner.length),
                     ).entries()) {
                         rows.push({
-                            key: `${item.id}:sub-${n}-${w}`,
+                            key: `${item.id}:sub${b}-${n}-${w}`,
                             role: item.role,
                             text: `${inner}${wrapped}`,
                             dim: true,

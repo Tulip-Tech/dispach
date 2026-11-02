@@ -344,7 +344,7 @@ export const SETTINGS: readonly Setting[] = [
     // an agent able to route its own calls could route a gated write through a child it wrote.
     {
         path: "subagents",
-        means: "children that run routed tool calls in their own context, as a list of {name, task, tools, route: {tools}, model?, maxSteps?, timeoutMs?}. Each tool must be pinned, and each routed slug belongs to one child",
+        means: "children that run work in their own context, as a list of {name, task, tools, route?: {tools}, spawn?, model?, maxSteps?, timeoutMs?}. route runs a child for those tool calls; spawn: true lets the model start it with delegate. Each tool must be pinned, and each routed slug belongs to one child",
         agentListed: false,
     },
     {

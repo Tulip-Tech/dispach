@@ -51,6 +51,21 @@ export interface SessionSummary extends SessionRecord {
     readonly messages: number
     readonly turns: number
     readonly lastActivityAt: string
+    /** When the session's checkpoint was last written (decision 15.21). Absent: never compacted. */
+    readonly compactedAt?: string
+}
+
+/**
+ * What a turn starts from in place of the stored messages up to `throughId` (decision 15.21): the
+ * digest and the person's requests. The messages themselves stay in the store.
+ */
+export interface SessionCheckpoint {
+    readonly throughId: number
+    readonly messages: readonly ChatMessage[]
+    readonly digest: "model" | "mechanical"
+    readonly tokensBefore: number
+    readonly tokensAfter: number
+    readonly createdAt: string
 }
 
 export interface StoredMessage {
@@ -160,6 +175,10 @@ export interface SessionStore {
     ): Promise<{ readonly previous: string }>
     /** Every rotated base and its head, for a listing that marks the current conversation. */
     heads(agentId: string): Promise<ReadonlyMap<string, string>>
+    /** The session's checkpoint (decision 15.21), or `undefined` when it was never compacted. */
+    checkpoint(agentId: string, sessionKey: string): Promise<SessionCheckpoint | undefined>
+    /** Write or replace the session's checkpoint. */
+    setCheckpoint(agentId: string, sessionKey: string, checkpoint: SessionCheckpoint): Promise<void>
 }
 
 export interface MessageStore {
@@ -171,6 +190,12 @@ export interface MessageStore {
     ): Promise<readonly StoredMessage[]>
     /** Oldest-first, the order the model needs. `limit` keeps the most recent N. */
     history(agentId: string, sessionKey: string, limit?: number): Promise<readonly ChatMessage[]>
+    /** Oldest-first with ids, every message after `afterId` (0 for all): what a checkpoint is cut from. */
+    historySince(
+        agentId: string,
+        sessionKey: string,
+        afterId: number,
+    ): Promise<readonly StoredMessage[]>
     /**
      * Newest-first with a cursor, the order a UI pages through.
      *

@@ -313,20 +313,42 @@ export interface ChannelActions {
  * this project has already watched go unread for weeks, and these are the reason a bot is silent.
  */
 /**
- * Two per-conversation switches beside "clear history": whether this conversation is drawn on by
- * history recall, and, on an agent with phases, which phase it is in. Recall is the lever for an
- * old wrong answer that keeps steering new ones, without deleting the chat it came from.
+ * Per-conversation controls beside "clear history": whether this conversation is drawn on by history
+ * recall, on an agent with phases which phase it is in, and compacting it now (decision 15.21). Recall
+ * is the lever for an old wrong answer that keeps steering new ones, without deleting the chat it came
+ * from; compacting folds the older turns into a saved digest, so a long chat stops paying for them on
+ * every turn, and keeps every message.
  */
 export function SessionControls(props: {
-    readonly session?: { readonly recall?: false; readonly phase?: string }
+    readonly session?: {
+        readonly recall?: false
+        readonly phase?: string
+        readonly compactedAt?: string
+    }
     readonly phases?: readonly string[]
     readonly busy?: boolean
     readonly onRecall: (recall: boolean) => void
     readonly onPhase: (phase: string) => void
+    readonly onCompact?: () => void
 }): React.ReactElement {
     const recalled = props.session?.recall !== false
     return (
         <>
+            {props.onCompact === undefined ? null : (
+                <button
+                    type="button"
+                    className="ghost hide-narrow"
+                    disabled={props.busy === true || props.session === undefined}
+                    title={
+                        props.session?.compactedAt === undefined
+                            ? "Fold the older turns into a saved digest, keeping the last two. Every message stays stored."
+                            : `Last compacted ${props.session.compactedAt}. Fold what came since, keeping the last two turns.`
+                    }
+                    onClick={props.onCompact}
+                >
+                    compact
+                </button>
+            )}
             <button
                 type="button"
                 className="ghost hide-narrow"

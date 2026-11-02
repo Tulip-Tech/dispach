@@ -45,6 +45,24 @@ describe("the key a client is told", () => {
         )
     })
 
+    test("resolve answers before sending what the 202 would, and creates nothing", async () => {
+        const { call } = await owned()
+        const resolve = (body: Record<string, unknown>) =>
+            call("POST", "/v1/agents/assistant/sessions/resolve", { body, token: TOKEN })
+        const owner = (await (await resolve({ sessionKey: "local:abc123" })).json()) as {
+            sessionKey: string
+        }
+        expect(owner.sessionKey).toBe(`owner:${OWNER}`)
+        const stranger = (await (
+            await resolve({ sessionKey: "api:eve", from: { id: "user:eve", kind: "user" } })
+        ).json()) as { sessionKey: string }
+        expect(stranger.sessionKey).toBe("api:eve")
+        const listed = (await (
+            await call("GET", "/v1/agents/assistant/sessions", { token: TOKEN })
+        ).json()) as unknown[]
+        expect(listed).toEqual([])
+    })
+
     test("a stranger keeps the key they sent", async () => {
         const { call } = await owned()
         const response = await send(call, {

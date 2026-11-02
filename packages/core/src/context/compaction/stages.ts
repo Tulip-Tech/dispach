@@ -499,6 +499,27 @@ function requestSpine(
 }
 
 /**
+ * A session checkpoint's messages (decision 15.21): `reset`'s output made durable, a digest of `span`
+ * and every request the person made in it. A digest already in the span is summarised with it, never
+ * kept as a request: it is the runtime's text, not the person's.
+ */
+export function checkpointMessages(
+    span: readonly ChatMessage[],
+    digest: string,
+): readonly ChatMessage[] {
+    const requests = span.filter((message) => isTurnStart(message) && message.origin !== "digest")
+    return [
+        digestMessage(digest),
+        ...(requests.length === 0
+            ? []
+            : [
+                  { role: "user", content: DIGEST_SPINE_HEADER, origin: "digest" } as const,
+                  ...requests,
+              ]),
+    ]
+}
+
+/**
  * S3 — digest everything but the newest turns.
  *
  * `digest` is supplied by the caller because producing it may be a model call, and a pure function

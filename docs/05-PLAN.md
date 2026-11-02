@@ -3566,7 +3566,9 @@ is told rather than charged, and `--yes` is the scripted way through.
 
 - **`/compact`.** Considered and rejected: the ladder already fires at 60% per step so there is no
   cliff to pre-empt, and compaction rewrites the prompt and never the store, so a manual trigger
-  would have nothing durable to do. Do not add it back without revisiting that.
+  would have nothing durable to do. Do not add it back without revisiting that. **Revisited in 0.2.3
+  (decision 15.21):** a session checkpoint is the durable thing, and `POST …/sessions/:key/compact`
+  writes one; the TUI command is still not built.
 - Provenance for capability fields other than `contextWindow`. Every field in a registry row has the
   same problem; the window is the one a budget divides by.
 

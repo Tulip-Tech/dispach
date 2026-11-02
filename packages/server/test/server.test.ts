@@ -673,6 +673,63 @@ describe("sessions", () => {
         await runtime.stop()
     })
 
+    test("resolving a key answers it unchanged on a channel-peer agent, and needs one", async () => {
+        const { call, runtime } = await harness()
+        const response = await call("POST", "/v1/agents/assistant/sessions/resolve", {
+            body: { sessionKey: "local:abc" },
+        })
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({ requested: "local:abc", sessionKey: "local:abc" })
+        const missing = await call("POST", "/v1/agents/assistant/sessions/resolve", { body: {} })
+        expect(missing.status).toBe(400)
+        await runtime.stop()
+    })
+
+    test("compacting a session saves a checkpoint and keeps every message (decision 15.21)", async () => {
+        const { call, runtime } = await withSession()
+        // One turn is nothing older than the two kept: refused, and nothing written.
+        const short = await call("POST", "/v1/agents/assistant/sessions/api%3As/compact", {
+            body: {},
+        })
+        expect(short.status).toBe(409)
+        expect(((await short.json()) as { error: { code: string } }).error.code).toBe(
+            "session_too_short",
+        )
+        for (const text of ["two", "three"]) {
+            await call("POST", "/v1/agents/assistant/messages", {
+                body: { text, sessionKey: "api:s" },
+            })
+            await Bun.sleep(120)
+        }
+        const before = (await (
+            await call("GET", "/v1/agents/assistant/sessions/api%3As/messages?limit=50")
+        ).json()) as { messages: unknown[] }
+        const response = await call("POST", "/v1/agents/assistant/sessions/api%3As/compact", {
+            body: { keepTurns: 1 },
+        })
+        expect(response.status).toBe(200)
+        const result = (await response.json()) as { keptTurns: number; digest: string }
+        expect(result).toMatchObject({ keptTurns: 1, digest: "mechanical" })
+        const after = (await (
+            await call("GET", "/v1/agents/assistant/sessions/api%3As/messages?limit=50")
+        ).json()) as { messages: unknown[] }
+        expect(after.messages.length).toBe(before.messages.length)
+        const listed = (await (await call("GET", "/v1/agents/assistant/sessions")).json()) as {
+            sessionKey: string
+            compactedAt?: string
+        }[]
+        expect(listed.find((row) => row.sessionKey === "api:s")?.compactedAt).toBeDefined()
+        const bad = await call("POST", "/v1/agents/assistant/sessions/api%3As/compact", {
+            body: { keepTurns: 0 },
+        })
+        expect(bad.status).toBe(400)
+        const missing = await call("POST", "/v1/agents/assistant/sessions/api%3Anope/compact", {
+            body: {},
+        })
+        expect(missing.status).toBe(404)
+        await runtime.stop()
+    })
+
     test("a session switched out of recall says so and keeps its messages (pilot.10)", async () => {
         const { call, runtime } = await withSession()
         const response = await call("POST", "/v1/agents/assistant/sessions/api%3As/recall", {
