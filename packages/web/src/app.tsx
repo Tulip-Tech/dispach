@@ -1796,6 +1796,13 @@ function Workspace(props: {
                                     return `Phase set to ${phase}.`
                                 })
                             }
+                            onCompact={() =>
+                                void write(`compact:${sessionKey}`, async (target) => {
+                                    const done = await target.compactSession(sessionKey)
+                                    await refreshSessions()
+                                    return `Compacted: the next turn starts from about ${done.after} tokens instead of ${done.before} (${done.digest} digest, last ${done.keptTurns} turns kept). Every message is still stored.`
+                                })
+                            }
                         />
                     ) : null}
                     {panel === "chat" ? (

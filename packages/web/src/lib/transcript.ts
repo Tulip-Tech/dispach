@@ -69,8 +69,11 @@ export type Row =
           readonly args?: Readonly<Record<string, unknown>>
           readonly output?: string
           readonly outputTruncated?: boolean
-          /** The routed call ran in a subagent (pilot.6): its calls, folded under this row. */
-          readonly subagent?: SubagentBlock
+          /**
+           * The subagents this call ran, folded under this row: one for a routed call (pilot.6), one
+           * per task for `delegate` (decision 15.20), in task order.
+           */
+          readonly subagents?: readonly SubagentBlock[]
       }
     | {
           readonly kind: "approval"
@@ -86,6 +89,9 @@ export type Row =
 
 export interface SubagentBlock {
     readonly name: string
+    /** A `delegate` task's label and position in its call. Absent for a routed call. */
+    readonly label?: string
+    readonly index?: number
     /** The child's own session, which is how its events find this row. */
     readonly sessionKey: string
     readonly calls: readonly {
@@ -200,34 +206,47 @@ export function reduce(state: Transcript, item: TurnStreamItem): Transcript {
     }
 }
 
-/** The tool row `match` picks, with its subagent block changed. Unchanged when nothing matches. */
+/**
+ * The tool row `match` picks, with its block for `sessionKey` changed or added. Unchanged when no row
+ * matches or `change` declines.
+ */
 function withBlock(
     state: Transcript,
     match: (row: Extract<Row, { kind: "tool" }>) => boolean,
+    sessionKey: string,
     change: (block: SubagentBlock | undefined) => SubagentBlock | undefined,
 ): Transcript {
     const index = state.rows.findIndex((row) => row.kind === "tool" && match(row))
     const row = state.rows[index]
     if (row === undefined || row.kind !== "tool") return state
-    const block = change(row.subagent)
+    const blocks = row.subagents ?? []
+    const at = blocks.findIndex((block) => block.sessionKey === sessionKey)
+    const block = change(at === -1 ? undefined : blocks[at])
     if (block === undefined) return state
+    const next =
+        at === -1
+            ? [...blocks, block].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+            : blocks.map((existing, i) => (i === at ? block : existing))
     const rows = [...state.rows]
-    rows[index] = { ...row, subagent: block }
+    rows[index] = { ...row, subagents: next }
     return { ...state, rows }
 }
 
+/** The row holding the subagent whose session is `sessionKey`. */
+const holds = (sessionKey: string) => (row: Extract<Row, { kind: "tool" }>) =>
+    row.subagents?.some((block) => block.sessionKey === sessionKey) === true
+
 /**
  * A subagent's own event, which a stream carries only when asked (`children: true`). Its calls go
- * under the routed row; its text, steps and `turn.end` are its own turn's and touch nothing here.
+ * under the row that ran it; its text, steps and `turn.end` are its own turn's and touch nothing here.
  */
 function onChild(state: Transcript, event: AnyEvent): Transcript {
-    const mine = (row: Extract<Row, { kind: "tool" }>) =>
-        row.subagent?.sessionKey === event.sessionKey
+    const key = event.sessionKey ?? ""
     // The child's return channel is how it hands back its answer, not work it did for the person.
     if ((event.data as { readonly slug?: string }).slug === SUBMIT_ARTIFACT) return state
     if (event.type === "tool.call") {
         const data = event.data as EventDataMap["tool.call"]
-        return withBlock(state, mine, (block) =>
+        return withBlock(state, holds(key), key, (block) =>
             block === undefined
                 ? undefined
                 : { ...block, calls: [...block.calls, { callId: data.callId, slug: data.slug }] },
@@ -235,7 +254,7 @@ function onChild(state: Transcript, event: AnyEvent): Transcript {
     }
     if (event.type === "tool.result") {
         const data = event.data as EventDataMap["tool.result"]
-        return withBlock(state, mine, (block) =>
+        return withBlock(state, holds(key), key, (block) =>
             block === undefined
                 ? undefined
                 : {
@@ -260,24 +279,29 @@ function onEvent(state: Transcript, event: AnyEvent): Transcript {
             return withBlock(
                 state,
                 (row) => row.callId === data.callId,
-                () => ({ name: data.name ?? "subagent", sessionKey: data.sessionKey, calls: [] }),
+                data.sessionKey,
+                (block) =>
+                    block ?? {
+                        name: data.name ?? "subagent",
+                        sessionKey: data.sessionKey,
+                        calls: [],
+                        ...(data.label === undefined ? {} : { label: data.label }),
+                        ...(data.index === undefined ? {} : { index: data.index }),
+                    },
             )
         }
 
         case "handoff.result": {
             const data = event.data as EventDataMap["handoff.result"]
-            return withBlock(
-                state,
-                (row) => row.subagent?.sessionKey === data.sessionKey,
-                (block) =>
-                    block === undefined
-                        ? undefined
-                        : {
-                              ...block,
-                              outcome: data.outcome,
-                              steps: data.steps,
-                              tokens: data.tokens.prompt + data.tokens.output,
-                          },
+            return withBlock(state, holds(data.sessionKey), data.sessionKey, (block) =>
+                block === undefined
+                    ? undefined
+                    : {
+                          ...block,
+                          outcome: data.outcome,
+                          steps: data.steps,
+                          tokens: data.tokens.prompt + data.tokens.output,
+                      },
             )
         }
 

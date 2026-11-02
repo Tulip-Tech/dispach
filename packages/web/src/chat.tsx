@@ -122,7 +122,9 @@ function RowView(props: {
                             )}
                         </details>
                     )}
-                    {row.subagent === undefined ? null : <Subagent block={row.subagent} />}
+                    {(row.subagents ?? []).map((block) => (
+                        <Subagent key={block.sessionKey} block={block} />
+                    ))}
                 </div>
             )
 
@@ -191,8 +193,9 @@ function settledText(settled: "granted" | "denied" | "abandoned" | "error"): str
 }
 
 /**
- * A routed call's subagent: one line while folded, the child's calls when opened. Closed by default,
- * like reasoning, because the reply is what a person reads first.
+ * A subagent a call ran (a routed call's, or one `delegate` task's): one line while folded, the
+ * child's calls when opened. Closed by default, like reasoning, because the reply is what a person
+ * reads first.
  */
 function Subagent(props: { readonly block: SubagentBlock }): React.ReactElement {
     const { block } = props
@@ -203,7 +206,8 @@ function Subagent(props: { readonly block: SubagentBlock }): React.ReactElement 
     return (
         <details className="subagent">
             <summary>
-                subagent {block.name} · {status}
+                subagent {block.name}
+                {block.label === undefined ? "" : ` · ${block.label}`} · {status}
             </summary>
             <ul>
                 {block.calls.map((call) => (

@@ -86,12 +86,12 @@ describe("the reducer", () => {
     test("puts the child's calls under the routed row and keeps them past its result", () => {
         const state = run(ROUTED)
         const row = state.items.find((item) => item.callId === "c1")
-        expect(row?.subagent?.name).toBe("inbox")
-        expect(row?.subagent?.lines.map((line) => line.text)).toEqual([
+        expect(row?.subagents?.[0]?.name).toBe("inbox")
+        expect(row?.subagents?.[0]?.lines.map((line) => line.text)).toEqual([
             "mail_list — ok · 12 ms",
             "mail_read — ok · 12 ms",
         ])
-        expect(row?.subagent?.summary).toBe("3 steps · 1.2k tokens · ok")
+        expect(row?.subagents?.[0]?.summary).toBe("3 steps · 1.2k tokens · ok")
         // The child's calls are not rows of their own, and its turn.end did not settle the parent.
         expect(state.items.filter((item) => item.role === "tool").length).toBe(1)
         expect(state.status).not.toBe("idle")
@@ -185,6 +185,7 @@ function source(listen: (handler: (event: AnyEvent) => void) => void): AppProps[
         sessions: async () => [],
         clearSession: async () => {},
         ownConversation: async () => undefined,
+        resolveSessionKey: async (key: string) => key,
         rotateSession: async () => undefined,
         tools: async () => ({ dialect: "nlt", catalogueTokens: 120, tools: [] }),
         context: async () => {
@@ -246,6 +247,52 @@ describe("the chat", () => {
             call("submit_artifact", "k9", true),
             result("submit_artifact", "k9", true),
         ])
-        expect(items.find((item) => item.callId === "c1")?.subagent?.lines).toEqual([])
+        expect(items.find((item) => item.callId === "c1")?.subagents?.[0]?.lines).toEqual([])
+    })
+})
+
+describe("a delegate call", () => {
+    test("draws one labelled line per task, in task order, under one row", () => {
+        const start = (sessionKey: string, index: number, label: string) =>
+            ev("handoff.start", {
+                member: "test",
+                task: "t",
+                sessionKey,
+                kind: "self",
+                name: "researcher",
+                callId: "d1",
+                index,
+                label,
+            })
+        // Started out of order, as concurrent children can be; the rows keep the call's order.
+        const { items } = run([
+            ev("turn.start", { source: "repl", inputTokens: 4, trust: "trusted" }),
+            call("delegate", "d1"),
+            start("subagent:b", 1, "competitors"),
+            start("subagent:a", 0, "pricing"),
+            ev("handoff.result", {
+                member: "test",
+                sessionKey: "subagent:b",
+                kind: "self",
+                name: "researcher",
+                callId: "d1",
+                index: 1,
+                label: "competitors",
+                outcome: "ok",
+                steps: 4,
+                tokens: { prompt: 900, output: 100 },
+            }),
+        ])
+        const text = transcriptRows(items, { showReasoning: false, quiet: true, columns: 80 }).map(
+            (row) => row.text,
+        )
+        const pricing = text.findIndex((line) =>
+            line.includes("↳ subagent researcher · pricing · running"),
+        )
+        const competitors = text.findIndex((line) =>
+            line.includes("↳ subagent researcher · competitors · 4 steps · 1.0k tokens · ok"),
+        )
+        expect(pricing).toBeGreaterThan(-1)
+        expect(competitors).toBeGreaterThan(pricing)
     })
 })

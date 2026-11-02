@@ -91,15 +91,57 @@ describe("a subagent in the web transcript", () => {
         expect(tools.length).toBe(1)
         const row = tools[0]
         if (row?.kind !== "tool") throw new Error("no tool row")
-        expect(row.subagent?.calls).toEqual([
+        expect(row.subagents?.[0]?.calls).toEqual([
             { callId: "k1", slug: "mail_read", ok: true, latencyMs: 9 },
         ])
-        expect(row.subagent?.outcome).toBe("ok")
+        expect(row.subagents?.[0]?.outcome).toBe("ok")
         expect(state.running).toBe(true)
 
         const html = renderToStaticMarkup(<Rows state={state} onAnswer={() => {}} />)
         expect(html).toContain('<details class="subagent">')
         expect(html).toContain("subagent inbox · 2 steps · 1000 tokens · ok")
         expect(html).toContain("mail_read")
+    })
+})
+
+describe("a delegate call in the web transcript", () => {
+    test("holds one block per task, in task order, each labelled", () => {
+        const start = (sessionKey: string, index: number, label: string) =>
+            event("handoff.start", {
+                member: "test",
+                task: "t",
+                sessionKey,
+                kind: "self",
+                name: "researcher",
+                callId: "d1",
+                index,
+                label,
+            })
+        // Started out of order, as concurrent children can be; the row keeps the call's order.
+        const state = [
+            event("turn.start", { source: "api", inputTokens: 3, trust: "trusted" }),
+            event("tool.call", { slug: "delegate", callId: "d1", argsHash: "h", mutating: false }),
+            start("subagent:b", 1, "competitors"),
+            start("subagent:a", 0, "pricing"),
+            event("handoff.result", {
+                member: "test",
+                sessionKey: "subagent:b",
+                kind: "self",
+                name: "researcher",
+                callId: "d1",
+                index: 1,
+                label: "competitors",
+                outcome: "budget",
+                steps: 12,
+                tokens: { prompt: 10, output: 5 },
+            }),
+        ].reduce(reduce, EMPTY)
+        const row = state.rows.find((item) => item.kind === "tool")
+        if (row?.kind !== "tool") throw new Error("no tool row")
+        expect(row.subagents?.map((block) => block.label)).toEqual(["pricing", "competitors"])
+        expect(row.subagents?.[1]?.outcome).toBe("budget")
+        const html = renderToStaticMarkup(<Rows state={state} onAnswer={() => {}} />)
+        expect(html).toContain("subagent researcher · pricing · running…")
+        expect(html).toContain("subagent researcher · competitors · 12 steps")
     })
 })

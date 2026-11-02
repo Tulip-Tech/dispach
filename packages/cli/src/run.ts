@@ -15,6 +15,7 @@
 
 import { randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
+import { resolve } from "node:path"
 import { createInterface, type Interface } from "node:readline"
 import { createClient } from "@dispach/client"
 import {
@@ -206,7 +207,14 @@ export async function runCommand(options: RunOptions): Promise<number> {
     // the sandbox root: one store for every agent, wherever `run` is invoked from — a cwd-relative
     // default gave the same agent a different session history in every directory.
     const legacy = defaultStorePath()
-    if (options.store === undefined && options.ephemeral !== true && existsSync(legacy)) {
+    // Only when the old default is a different file: run from the home directory (the container's
+    // cwd) both are the sandbox store, and the note told people to pass the path they were using.
+    if (
+        options.store === undefined &&
+        options.ephemeral !== true &&
+        resolve(legacy) !== resolve(storePath()) &&
+        existsSync(legacy)
+    ) {
         process.stdout.write(
             `note: a session store exists at ${legacy} from an earlier version — pass --store ${legacy} to keep using it; the default is now ${storePath()}\n`,
         )
@@ -348,6 +356,9 @@ export async function runCommand(options: RunOptions): Promise<number> {
             const rotated = await agent.rotateSession({ source: "repl" })
             if (rotated !== undefined) session.current = rotated.sessionKey
         }
+        // The key the turns will actually run in. Under `sessions.scope: owner` a named `--session`
+        // lands in the owner's conversation, and every renderer follows events by key.
+        session.current = await agent.resolveSessionKey(session.current ?? "", { source: "repl" })
         const sessionKey = session.current
 
         // Reasoning is shown by default on a model that has any.
@@ -404,6 +415,7 @@ export async function runCommand(options: RunOptions): Promise<number> {
                 await agent.clearSession(key)
             },
             ownConversation: () => ownConversationOf(agent),
+            resolveSessionKey: (key) => agent.resolveSessionKey(key, { source: "repl" }),
             rotateSession: async () => (await agent.rotateSession({ source: "repl" }))?.sessionKey,
             context: async (key) => contextViewOf(agent, key),
             streamFilter: () => agent.streamFilter(),
@@ -862,6 +874,10 @@ async function runAttached(
             const rotated = await source.rotateSession()
             if (rotated !== undefined) input.session.current = rotated
         }
+        // Asked of the host, by the rule its `POST /messages` applies: the key the CLI named and the
+        // key its turns run in differ under `sessions.scope: owner`, and following the wrong one is a
+        // run that prints no reply.
+        input.session.current = await source.resolveSessionKey(input.session.current ?? "")
         const sessionKey = input.session.current ?? ""
 
         const banner =

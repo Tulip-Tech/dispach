@@ -132,6 +132,12 @@ export interface AgentSource {
      * session list; the key a run then sends resolves to the same conversation on the host.
      */
     ownConversation(): Promise<string | undefined>
+    /**
+     * The conversation a turn sent with `sessionKey` will run in. Under `sessions.scope: owner` it is
+     * `owner:<P>` whatever the terminal named, and both renderers follow a turn's events by key, so a
+     * run resolves before it sends: 0.2.2's `run --plain` filtered out every event of its own reply.
+     */
+    resolveSessionKey(sessionKey: string): Promise<string>
     /** `/new` under an owner or peer scope: the rotated key, or `undefined` when nothing rotates. */
     rotateSession(): Promise<string | undefined>
     tools(): Promise<ToolsView>
@@ -194,6 +200,7 @@ export function embeddedSource(input: {
     readonly sessions: () => Promise<readonly SourceSession[]>
     readonly clearSession: (sessionKey: string) => Promise<void>
     readonly ownConversation: () => Promise<string | undefined>
+    readonly resolveSessionKey: (sessionKey: string) => Promise<string>
     readonly rotateSession: () => Promise<string | undefined>
     readonly context: (sessionKey: string) => Promise<ContextView>
     readonly streamFilter: () => StreamFilter
@@ -213,6 +220,7 @@ export function embeddedSource(input: {
         sessions: input.sessions,
         clearSession: input.clearSession,
         ownConversation: input.ownConversation,
+        resolveSessionKey: input.resolveSessionKey,
         rotateSession: input.rotateSession,
         // Built from the live registry rather than fetched, and `toolsView` takes the structural
         // source rather than an `Agent`, which is why this is a projection and not a copy.
@@ -267,6 +275,7 @@ export interface ApiClient {
         }>
         clearSession(sessionKey: string): Promise<unknown>
         rotateSession(): Promise<{ readonly sessionKey: string }>
+        resolveSessionKey(sessionKey: string): Promise<string>
         reload(): Promise<{ readonly adopted: readonly string[] }>
         tools(): Promise<
             readonly {
@@ -425,6 +434,15 @@ export function remoteSource(input: {
             (await agent.sessions()).find(
                 (session) => session.head !== false && session.sessionKey.startsWith("owner:"),
             )?.sessionKey,
+        // The host's own rule, asked rather than copied. A host older than the route (0.2.2) answers
+        // 404, and the key as named is the best answer left: what that host's run printed anyway.
+        resolveSessionKey: async (sessionKey) => {
+            try {
+                return await agent.resolveSessionKey(sessionKey)
+            } catch {
+                return sessionKey
+            }
+        },
         // `409 session_not_rotatable` is the channel-peer answer: a fresh key of the terminal's own.
         rotateSession: async () => {
             try {
