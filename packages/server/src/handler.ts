@@ -108,6 +108,7 @@ import {
     ApprovalBody,
     AssigneeBody,
     ChannelPatchBody,
+    CompactBody,
     ConfigBody,
     ConversationBody,
     ConversationMessageBody,
@@ -125,6 +126,7 @@ import {
     ProvisionBody,
     parseBody,
     RecallBody,
+    ResolveBody,
     RotateBody,
     SecretsBody,
     SpaceWriterBody,
@@ -3524,6 +3526,37 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      * "New conversation" for an owner or peer scope (decision 15.12): the caller's conversation now
      * means a fresh key, on every surface, Telegram included. Registered before `:key` routes.
      */
+    /**
+     * The conversation a message naming `sessionKey` would run in, by the same function `POST
+     * /messages` applies before its 202 (`sessionFor`). Under `sessions.scope: owner` a terminal's own
+     * key lands in `owner:<P>`, and a client following the turn's events by key has to know that
+     * before it sends, or it filters out the whole reply: `dispach run --plain` printed nothing in
+     * 0.2.2. Nothing is created or changed.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/resolve",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(ResolveBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const requested = parsed.value.sessionKey
+                const outside = outsideSession(context, requested)
+                if (outside !== undefined) return outside
+                const parsedFrom = parseFrom(parsed.value.from)
+                if (parsedFrom.kind === "error") return fail(parsedFrom.error, 400)
+                const from = senderFor(context.principal, parsedFrom.from)
+                if (!from.ok) return fail(from.error, 403)
+                return json({
+                    requested,
+                    sessionKey: await sessionFor(agent, context.principal, requested, from.from),
+                })
+            }),
+        { capability: "chat" },
+    )
+
     router.add(
         "POST",
         "/v1/agents/:id/sessions/rotate",
@@ -3663,6 +3696,44 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                     return notFound("session", key)
                 await agent.store.sessions.setRecall(agent.id, key, parsed.value.recall)
                 return json({ sessionKey: key, recall: parsed.value.recall })
+            }),
+        { capability: "write" },
+    )
+
+    /**
+     * Compact a conversation now (decision 15.21): everything before its last `keepTurns` turns becomes
+     * a digest and the person's requests, saved as the session's checkpoint, and the next turn starts
+     * from it. Waits for a turn running in that session. The stored messages are untouched, so the
+     * transcript, recall and forgetting are unchanged.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/:key/compact",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(CompactBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const key = context.params.key ?? ""
+                const outside = outsideSession(context, key)
+                if (outside !== undefined) return outside
+                if ((await agent.store.sessions.get(agent.id, key)) === undefined)
+                    return notFound("session", key)
+                try {
+                    return json(
+                        await agent.compactSession(key, {
+                            ...(parsed.value.keepTurns === undefined
+                                ? {}
+                                : { keepTurns: parsed.value.keepTurns }),
+                            signal: context.request.signal,
+                        }),
+                    )
+                } catch (error) {
+                    if (isHarnessError(error) && error.code === "session_too_short")
+                        return fail(error.toDetail(), 409)
+                    throw error
+                }
             }),
         { capability: "write" },
     )

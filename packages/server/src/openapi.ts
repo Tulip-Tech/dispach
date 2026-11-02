@@ -38,6 +38,7 @@ import { z } from "zod"
 import {
     ApprovalBody,
     AssigneeBody,
+    CompactBody,
     ConversationBody,
     ConversationMessageBody,
     DecisionBody,
@@ -53,6 +54,7 @@ import {
     ProjectBody,
     ProvisionBody,
     RecallBody,
+    ResolveBody,
     RotateBody,
     SecretsBody,
     SpaceWriterBody,
@@ -463,9 +465,19 @@ const DOCS: Readonly<Record<string, RouteDoc>> = {
         summary: "Move a session into a declared phase.",
         body: PhaseBody,
     },
+    "POST /v1/agents/:id/sessions/:key/compact": {
+        summary:
+            "Fold a conversation's older turns into a saved digest; the next turn starts from it, and every message stays stored.",
+        body: CompactBody,
+    },
     "POST /v1/agents/:id/sessions/:key/recall": {
         summary: "Keep a conversation out of history recall, or put it back; its messages stay.",
         body: RecallBody,
+    },
+    "POST /v1/agents/:id/sessions/resolve": {
+        summary:
+            "The conversation a message naming this sessionKey would run in, before sending it; nothing changes.",
+        body: ResolveBody,
     },
     "POST /v1/agents/:id/sessions/rotate": {
         summary:

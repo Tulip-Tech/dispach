@@ -2469,6 +2469,88 @@
                 }
             }
         },
+        "/v1/agents/{id}/sessions/resolve": {
+            "post": {
+                "summary": "The conversation a message naming this sessionKey would run in, before sending it; nothing changes.",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "401": {
+                        "description": "No credential, or one this server does not accept."
+                    },
+                    "404": {
+                        "description": "No such agent, or it is switched off."
+                    }
+                },
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "type": "object",
+                                "properties": {
+                                    "sessionKey": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "code": "session_key_required",
+                                        "hint": "Send { \"sessionKey\": \"local:abc123\" }: the key a message would name.",
+                                        "description": "The key a message would carry as its sessionKey."
+                                    },
+                                    "from": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "code": "sender_invalid",
+                                                "hint": "Send { \"from\": { \"id\": \"agent:ops-bot\", \"kind\": \"agent\" } }, or omit it entirely for a turn the token-holder is sending itself.",
+                                                "description": "Stable identifier for the sender. Appears on the turn row and in events."
+                                            },
+                                            "kind": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "user",
+                                                    "agent"
+                                                ],
+                                                "code": "sender_invalid",
+                                                "hint": "This field decides the trust boundary — \"agent\" fences the message and blocks mutating tools for the turn, \"user\" does not — so there is no default and an unknown value is refused rather than guessed at. A turn the token-holder is sending itself omits \"from\".",
+                                                "description": "The trust boundary. \"agent\" fences the text as data and blocks mutating tools for the whole turn."
+                                            },
+                                            "name": {
+                                                "code": "sender_invalid",
+                                                "hint": "A display name, shown beside the sender id. Omit it rather than sending an empty string.",
+                                                "description": "Human-readable name for the sender.",
+                                                "type": "string"
+                                            }
+                                        },
+                                        "required": [
+                                            "id",
+                                            "kind"
+                                        ],
+                                        "description": "Attribution for a turn somebody other than the token-holder is sending. Omit for your own."
+                                    }
+                                },
+                                "required": [
+                                    "sessionKey"
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/v1/agents/{id}/sessions/rotate": {
             "post": {
                 "summary": "Start the caller's conversation afresh on every surface (sessions.scope owner or peer).",
@@ -2766,6 +2848,61 @@
                                 "required": [
                                     "recall"
                                 ]
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/agents/{id}/sessions/{key}/compact": {
+            "post": {
+                "summary": "Fold a conversation's older turns into a saved digest; the next turn starts from it, and every message stays stored.",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "key",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "401": {
+                        "description": "No credential, or one this server does not accept."
+                    },
+                    "404": {
+                        "description": "No such agent, or it is switched off."
+                    }
+                },
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "type": "object",
+                                "properties": {
+                                    "keepTurns": {
+                                        "code": "compact_keep_invalid",
+                                        "hint": "Send { \"keepTurns\": 2 }, a whole number of at least 1, or omit it to keep the last 2 turns verbatim.",
+                                        "description": "How many of the newest turns stay verbatim. Everything before them becomes a digest and the person's requests. Default 2.",
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 9007199254740991
+                                    }
+                                }
                             }
                         }
                     }

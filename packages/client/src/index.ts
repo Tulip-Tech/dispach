@@ -353,6 +353,21 @@ export interface AgentClient {
         recall: boolean,
     ): Promise<{ readonly sessionKey: string; readonly recall: boolean }>
     /**
+     * The conversation a message naming `sessionKey` would run in, without sending one. Under
+     * `sessions.scope: owner` a caller's own key runs in `owner:<P>`; follow a turn's events by the
+     * key this returns, not the one sent.
+     */
+    resolveSessionKey(sessionKey: string): Promise<string>
+    /**
+     * Fold everything before the last `keepTurns` turns (default 2) into a saved digest, so the next
+     * turn starts from it (decision 15.21). Every message stays stored. `409 session_too_short` when
+     * nothing is older than the kept turns.
+     */
+    compactSession(
+        sessionKey: string,
+        options?: { readonly keepTurns?: number },
+    ): Promise<CompactedSession>
+    /**
      * Start the caller's conversation afresh on every surface, for an agent whose `sessionScope` is
      * `owner` or `peer` (`docs/23-SPEC-SESSIONS.md`). `409 session_not_rotatable` for `channel-peer`,
      * where a new conversation is simply a new `sessionKey` on the next message.
@@ -804,6 +819,18 @@ export interface SessionSummary {
      * rotation left behind. True for every key under `channel-peer`. Absent from a server before 0.3.
      */
     readonly head?: boolean
+    /** When the session's checkpoint was last written (`compactSession`). Absent: never compacted. */
+    readonly compactedAt?: string
+}
+
+/** What `compactSession` did. `before` and `after` are estimated tokens a turn starts from. */
+export interface CompactedSession {
+    readonly sessionKey: string
+    readonly before: number
+    readonly after: number
+    /** `model` when a declared `model.compactor` wrote the digest; `mechanical` otherwise. */
+    readonly digest: "model" | "mechanical"
+    readonly keptTurns: number
 }
 
 export interface MessagesOptions {
@@ -1659,6 +1686,25 @@ export function createClient(options: ClientOptions): DispachClient {
                     "POST",
                     at(`/sessions/${encodeURIComponent(sessionKey)}/recall`),
                     { body: { recall } },
+                ),
+
+            resolveSessionKey: async (sessionKey) =>
+                (
+                    await json<{ sessionKey: string }>("POST", at("/sessions/resolve"), {
+                        body: { sessionKey },
+                    })
+                ).sessionKey,
+
+            compactSession: (sessionKey, options) =>
+                json<CompactedSession>(
+                    "POST",
+                    at(`/sessions/${encodeURIComponent(sessionKey)}/compact`),
+                    {
+                        body:
+                            options?.keepTurns === undefined
+                                ? {}
+                                : { keepTurns: options.keepTurns },
+                    },
                 ),
 
             rotateSession: (options) =>
