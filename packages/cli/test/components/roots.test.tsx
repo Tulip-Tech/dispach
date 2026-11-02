@@ -645,6 +645,7 @@ function stubSource(): AppProps["source"] {
         sessions: async () => [],
         clearSession: async () => {},
         ownConversation: async () => undefined,
+        resolveSessionKey: async (key: string) => key,
         rotateSession: async () => undefined,
         tools: async () => ({ dialect: "nlt", catalogueTokens: 120, tools: [] }),
         context: async () => {

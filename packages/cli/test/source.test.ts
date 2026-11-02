@@ -69,6 +69,8 @@ function fakeClient(): {
                 calls.push("rotate")
                 return { sessionKey: "owner:me:k7m2xp~ab12cd" }
             },
+            // An owner-scoped host: whatever a terminal names, its turns run in the owner's.
+            resolveSessionKey: async () => "owner:me:k7m2xp",
             reload: async () => {
                 calls.push("reload")
                 return { adopted: ["milo", "researcher"] }
@@ -169,6 +171,7 @@ describe("a source knows which kind it is", () => {
             sessions: async () => [],
             clearSession: async () => {},
             ownConversation: async () => undefined,
+            resolveSessionKey: async (key: string) => key,
             rotateSession: async () => undefined,
             context: async () => {
                 throw new Error("unused")
@@ -398,6 +401,38 @@ describe("the person's own conversation, attached", () => {
         expect(await source.ownConversation()).toBe("owner:me:k7m2xp~ab12cd")
         expect(await source.rotateSession()).toBe("owner:me:k7m2xp~ab12cd")
         await source.close()
+    })
+
+    test("the key a run follows is the host's answer, and the named key on a host without the route", async () => {
+        const fake = fakeClient()
+        const owner = remoteSource({
+            client: fake.client,
+            agentId: "milo",
+            description: DESCRIPTION,
+            host: { baseUrl: "http://127.0.0.1:7420", pid: 4711 },
+        })
+        // 0.2.2's `run --plain` followed `local:abc123` while its reply streamed under the owner's
+        // key, and printed nothing.
+        expect(await owner.resolveSessionKey("local:abc123")).toBe("owner:me:k7m2xp")
+        await owner.close()
+
+        const base = fake.client.agent("milo")
+        const old = remoteSource({
+            client: {
+                ...fake.client,
+                agent: () => ({
+                    ...base,
+                    resolveSessionKey: async () => {
+                        throw new Error("404 not_found")
+                    },
+                }),
+            },
+            agentId: "milo",
+            description: DESCRIPTION,
+            host: { baseUrl: "http://127.0.0.1:7420", pid: 4711 },
+        })
+        expect(await old.resolveSessionKey("local:abc123")).toBe("local:abc123")
+        await old.close()
     })
 
     test("a channel-peer host refuses rotation, and /new falls back to a key of the terminal's own", async () => {

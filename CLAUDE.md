@@ -1473,11 +1473,19 @@ Never claim a performance property without a number in `evals/` and a script to 
   ladder often stops after `trim`, because `trim` reached the target — four tests failed asserting a digest
   had been written when the correct behaviour was not to write one. Forcing escalation needs a squeezed
   *history* budget (a large fixed part), not merely high pressure.
-- **Compaction rewrites the prompt, never the store.** A resumed session re-reads the whole conversation
-  and re-compacts it, so a turn whose pressure has fallen below `trim` shows a previously-snipped
-  observation in full again. Verified live. That is the right direction — the store is the audit trail —
-  but it means a pointer is not durable in the transcript and a test asserting "the marker is still there
-  next turn" is asserting something false.
+- **Compaction rewrites the prompt, never the messages — and a checkpoint is the one durable part.** A
+  resumed session re-reads the conversation and re-compacts it, so a turn whose pressure has fallen below
+  `trim` shows a previously-snipped observation in full again. Verified live. That is the right direction —
+  the store is the audit trail — but a pointer is not durable in the transcript and a test asserting "the
+  marker is still there next turn" is asserting something false. The cost of that design was found in
+  0.2.2: a session over `reset` re-ran `reset` on **every** turn, re-paying a compactor's digest each time
+  and warning "more than once" from the second. Decision 15.21 added `session_checkpoints`: a turn whose
+  `reset` fired, and `POST …/sessions/:key/compact`, save a digest plus the person's requests as what the
+  next turn starts from, through a message id. `messages` keeps every row, so the transcript, recall and
+  `memory_forget` are unchanged; only `#promptHistory` reads the checkpoint, and `history()` — the
+  screen's read — must not. The auto checkpoint keeps **one** turn, not `collapse`'s two: `reset` fired
+  because the last two did not fit, so keeping two leaves the next turn over `reset` again (measured in
+  `checkpoint.test.ts`, which reverts red without the save).
 - **Every marker the runtime writes must carry what it takes to act on it, and a placeholder in a prompt is
   an instruction.** `snip`'s marker said an observation "is still readable with artifact_read" and named no
   id; a live model correctly reported there was no id to pass and answered from the visible fragment.
@@ -2030,6 +2038,12 @@ Never claim a performance property without a number in `evals/` and a script to 
   Eighth, found live a day later: the schedule `PATCH` rebuilt the stored row as a literal before
   validating, so `{expr}` alone erased `tools`, `timeoutMs` and `maxSteps`, the three fields added
   after it. Its guard writes every optional field, patches one, and requires the rest unmoved.
+- **A renderer that follows a turn by session key must follow the key the turn runs in, not the one it
+  sent.** Under `sessions.scope: owner` the server moves a terminal's `local:` key to `owner:<P>`, and
+  `run --plain` filtered every event of its own reply out, printing only the stats line — shipped in 0.2.2
+  and invisible in tests, which all used `channel-peer` or named the owner key. The CLI resolves once,
+  before the turn (`AgentSource.resolveSessionKey`; attached, `POST …/sessions/resolve`, the server's own
+  `sessionFor`), rather than copying the rule: a second copy of `resolveSessionKey` is a second answer.
 - **A reported symptom can be true with a false mechanism, and fixing the mechanism you assumed leaves
   the cause running.** "`init` always creates the agent inside the codebase" was accurate and had
   nothing to do with the default: driven under a pty against the *installed* binary, the wizard offers

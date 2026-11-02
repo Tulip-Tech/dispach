@@ -1179,13 +1179,20 @@ asked turn is one hop (no `handoff`, no `ask_agent`). A change to an assignment,
 peer's `description` reloads the agents whose peer list it changes; nothing waits for a restart.
 Person-only, like the rest of `delegation`.
 
-### `subagents` (since 0.2.0-pilot.6)
+### `subagents` (since 0.2.0-pilot.6; `spawn` since 0.2.3)
 
-Throwaway children of this agent that run a routed tool call in a context of their own. **The harness
-routes, never the model:** a call to a slug under `route.tools` goes through the policy, the write
-gate and a stand-in's deferral exactly as it would without a child, and only then does the child run
-in place of the tool. The parent's observation is the child's artifact; the raw output stays in the
-child's `subagent:<runId>` session.
+Throwaway children of this agent that run work in a context of their own. A child starts in one of
+two ways, and declares which:
+
+- **Routed** (`route.tools`): **the harness routes, never the model.** A call to a routed slug goes
+  through the policy, the write gate and a stand-in's deferral exactly as it would without a child,
+  and only then does the child run in place of the tool.
+- **Spawned** (`spawn: true`, decision 15.20): the model starts it with the core tool `delegate`,
+  handing it a task in its own words. Opt-in per child, so routing stays the harness's decision for
+  every child that does not say so.
+
+Either way the parent's observation is the child's artifact; the raw output stays in the child's
+`subagent:<runId>` session.
 
 ```yaml
 model:
@@ -1198,6 +1205,11 @@ subagents:
     tools: [GMAIL_FETCH_EMAILS, GMAIL_GET_THREAD]   # a subset of tools.pinned / tools.local
     route:
       tools: [GMAIL_FETCH_EMAILS]                    # calls to these run the child
+  - name: researcher
+    task: Research one question on the web and report what you found, with sources.
+    tools: [web_search, web_fetch]
+    spawn: true                                      # the model may start it with delegate()
+    timeoutMs: 180000                                # bound on each delegate task
     # artifact:   a JSON Schema object, as for team.members; default {summary}
     # model:      a role under model:; default model.subagent when declared, else main
     # maxSteps:   lowers limits.maxSteps for the child
@@ -1208,11 +1220,12 @@ subagents:
 | `name` | Required, unique. Names the child in events, sessions and usage. |
 | `task` | Required. What the child is for, written ahead of the call it is handed. |
 | `tools` | Required. Exact slugs, each in `tools.pinned` or `tools.local` (`subagent_tool_not_pinned`). A child only narrows its parent. Its catalogue is these plus `submit_artifact`. |
-| `route.tools` | Required. Each slug must be in this child's `tools` (`subagent_route_outside_tools`), and a slug is routed by one child only (`subagent_route_duplicate`). |
+| `route.tools` | Required unless `spawn` is set; a child with neither is refused (`subagent_unreachable`). Each slug must be in this child's `tools` (`subagent_route_outside_tools`), and a slug is routed by one child only (`subagent_route_duplicate`). |
+| `spawn` | Optional, default `false` (0.2.3). `true` lets the model start this child with `delegate`. Any spawnable child gives the agent the tool. |
 | `artifact` | Optional JSON Schema object. Absent: `{summary: string}`, told to keep every id, name, date and amount exactly. One string, because a list is the field a model formats wrong. |
 | `model` | Optional role name (`subagent_role_unknown` when undeclared). Absent: `model.subagent`, else `main`. Usage rows and `model.result` say `role: subagent` either way, with `model` naming the endpoint. |
 | `maxSteps` | Optional. Lowers `limits.maxSteps` for the child, never raises it. |
-| `timeoutMs` | Optional (pilot.15). The routed call's bound in place of `limits.toolTimeoutMs`, for this child's `route.tools` only, so a child making fifteen slow reads can have five minutes without `exec` getting five minutes too. The child is still ended a second before it, so it reports a timeout instead of being abandoned. |
+| `timeoutMs` | Optional (pilot.15). The routed call's bound in place of `limits.toolTimeoutMs`, for this child's `route.tools` only, so a child making fifteen slow reads can have five minutes without `exec` getting five minutes too; and the bound on each `delegate` task this child runs. The child is still ended a second before it, so it reports a timeout instead of being abandoned. |
 
 `subagents` is set as a whole list by a person or an embedder: `PATCH /config` (alone or in
 `changes[]`) and the `config` command, checked exactly as at load. The agent's `config_set` cannot set
@@ -1228,6 +1241,19 @@ skills or recalled memory. **Depth is 1**: a child's calls run the tool, never a
 
 **Trust of the artifact.** Untrusted when the routed tool is declared untrusted, or when the child read
 untrusted output; trusted otherwise.
+
+**`delegate(tasks)`** (decision 15.20, `docs/25-SPEC-FAN-OUT.md`). Registered at load when any child
+declares `spawn: true`; its description lists each spawnable child with its task and tools. `tasks`
+is 1 to 8 objects of `{task, label?, subagent?}` (`subagent` only when more than one child is
+spawnable). Each task runs as that child, in a fresh `subagent:<runId>` session, with everything a
+routed child inherits; the child never sees `delegate`. Tasks for a child whose tools are all
+read-only run concurrently, at most `limits.maxParallelTools` at a time; a child holding a tool that
+changes things runs its tasks one at a time, and makes `delegate` itself mutating (refused in a
+tainted turn under `onMutate: refuse`, never retried). The call is bounded by the longest `timeoutMs`
+of the spawnable children, else `limits.toolTimeoutMs`. The parent reads one section per task (its
+artifact, or what stopped it and its session); only a call whose every task failed throws
+(`delegate_failed`). Each task emits `handoff.start`/`handoff.result` with `index` and `label`.
+Refusals: `delegate_tasks_invalid`, `delegate_subagent_unknown`.
 
 **A child reads its call's whole output.** Its observation cap is the larger of
 `context.observationMaxTokens` and three quarters of its own prompt budget (its model's window less

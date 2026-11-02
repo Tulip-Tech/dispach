@@ -1251,6 +1251,33 @@ ALTER TABLE participants ADD COLUMN channel_ids TEXT;
 ALTER TABLE handoffs ADD COLUMN kind TEXT NOT NULL DEFAULT 'handoff' CHECK (kind IN ('handoff', 'ask'));
 `,
     },
+    {
+        version: 35,
+        name: "session_checkpoints",
+        /**
+         * Compaction's first durable state (decision 15.21, docs/25-SPEC-FAN-OUT.md). Until now the ladder
+         * rewrote the prompt and never the store, so a long session re-ran its compaction, and re-paid a
+         * compactor's digest, on every turn. A checkpoint is what a turn starts from instead of the
+         * messages up to and including through_id: the digest and the person's requests as one JSON
+         * array of chat messages. messages keeps every row, so the transcript, recall and forgetting
+         * are unchanged. One per session, gone with the session (cascade) and with a clear (explicit).
+         */
+        sql: `
+CREATE TABLE session_checkpoints (
+    agent_id      TEXT NOT NULL,
+    session_key   TEXT NOT NULL,
+    through_id    INTEGER NOT NULL,
+    messages      TEXT NOT NULL,
+    digest        TEXT NOT NULL CHECK (digest IN ('model', 'mechanical')),
+    tokens_before INTEGER NOT NULL,
+    tokens_after  INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (agent_id, session_key),
+    FOREIGN KEY (agent_id, session_key)
+        REFERENCES sessions (agent_id, session_key) ON DELETE CASCADE
+);
+`,
+    },
 ]
 
 export interface MigrationReport {

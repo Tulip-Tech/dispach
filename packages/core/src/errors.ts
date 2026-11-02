@@ -439,6 +439,19 @@ export function sessionsScopeUnassigned(agentId: string, scope: string): ErrorDe
 }
 
 /**
+ * A compaction asked of a session too short to have anything before its kept turns (decision 15.21).
+ * A 409 on the route: the request was understood and the session is not in a state to do it.
+ */
+export function sessionTooShort(sessionKey: string, turns: number, keep: number): HarnessError {
+    return new HarnessError({
+        code: "session_too_short",
+        message: `Session ${sessionKey} has ${turns} turn(s) since it was last compacted, and ${keep} are kept, so there is nothing to compact.`,
+        hint: "Compact it once it is longer, or keep fewer turns with keepTurns (at least 1).",
+        field: "keepTurns",
+    })
+}
+
+/**
  * A pinned tool that this configuration allows exactly once per turn.
  *
  * A tool that both changes things and returns text from outside the conversation taints the turn with

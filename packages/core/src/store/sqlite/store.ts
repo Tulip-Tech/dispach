@@ -125,6 +125,16 @@ interface SummaryRow extends SessionRow {
     messages: number
     turns: number
     last_activity_at: string
+    compacted_at: string | null
+}
+
+interface CheckpointRow {
+    through_id: number
+    messages: string
+    digest: string
+    tokens_before: number
+    tokens_after: number
+    created_at: string
 }
 
 interface MessageRow {
@@ -401,6 +411,7 @@ function toSummary(row: SummaryRow): SessionSummary {
         messages: row.messages,
         turns: row.turns,
         lastActivityAt: row.last_activity_at,
+        ...(row.compacted_at === null ? {} : { compactedAt: row.compacted_at }),
     }
 }
 
@@ -833,7 +844,9 @@ export class SqliteStore implements Store {
                             s.updated_at,
                             COALESCE((SELECT MAX(created_at) FROM messages m
                                        WHERE m.agent_id = s.agent_id AND m.session_key = s.session_key), '')
-                        ) AS last_activity_at
+                        ) AS last_activity_at,
+                        (SELECT created_at FROM session_checkpoints c
+                          WHERE c.agent_id = s.agent_id AND c.session_key = s.session_key) AS compacted_at
                    FROM sessions s
                   WHERE s.agent_id = ?
                   ORDER BY last_activity_at DESC`,
@@ -928,6 +941,25 @@ export class SqliteStore implements Store {
             memoryDf: db.prepare(MEMORY_DF_SQL),
             memoryCandidates: db.prepare(MEMORY_CANDIDATES_SQL),
             memoryVocabulary: db.prepare(MEMORY_VOCABULARY_SQL),
+            historySince: db.prepare(
+                `SELECT ${MESSAGE_COLUMNS} FROM messages
+                  WHERE agent_id = ? AND session_key = ? AND id > ? ORDER BY id ASC`,
+            ),
+            checkpointGet: db.prepare(
+                "SELECT * FROM session_checkpoints WHERE agent_id = ? AND session_key = ?",
+            ),
+            checkpointSet: db.prepare(
+                `INSERT INTO session_checkpoints
+                    (agent_id, session_key, through_id, messages, digest, tokens_before, tokens_after, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (agent_id, session_key) DO UPDATE SET
+                     through_id = excluded.through_id, messages = excluded.messages,
+                     digest = excluded.digest, tokens_before = excluded.tokens_before,
+                     tokens_after = excluded.tokens_after, created_at = excluded.created_at`,
+            ),
+            checkpointDelete: db.prepare(
+                "DELETE FROM session_checkpoints WHERE agent_id = ? AND session_key = ?",
+            ),
             historyAll: db.prepare(
                 `SELECT ${MESSAGE_COLUMNS} FROM messages
                   WHERE agent_id = ? AND session_key = ? ORDER BY id ASC`,
@@ -1393,6 +1425,8 @@ export class SqliteStore implements Store {
                 db.transaction(() => {
                     q.messagesDelete.run(agentId, sessionKey)
                     q.turnsDelete.run(agentId, sessionKey)
+                    // It summarises messages that no longer exist.
+                    q.checkpointDelete.run(agentId, sessionKey)
                     q.memoryDeleteSource.run(agentId, sessionSource(sessionKey))
                     q.memorySourceDelete.run(agentId, sessionSource(sessionKey))
                     q.sessionTouch.run(nowIso(), agentId, sessionKey)
@@ -1414,6 +1448,31 @@ export class SqliteStore implements Store {
                     q.headSet.run(agentId, baseKey, headKey, nowIso())
                     return { previous }
                 }),
+            checkpoint: async (agentId, sessionKey) => {
+                const row = q.checkpointGet.get<CheckpointRow>(agentId, sessionKey)
+                if (row === undefined) return undefined
+                return {
+                    throughId: row.through_id,
+                    messages: JSON.parse(row.messages) as ChatMessage[],
+                    digest: row.digest === "model" ? "model" : "mechanical",
+                    tokensBefore: row.tokens_before,
+                    tokensAfter: row.tokens_after,
+                    createdAt: row.created_at,
+                }
+            },
+            setCheckpoint: async (agentId, sessionKey, checkpoint) => {
+                ensureSession(agentId, sessionKey)
+                q.checkpointSet.run(
+                    agentId,
+                    sessionKey,
+                    checkpoint.throughId,
+                    JSON.stringify(checkpoint.messages),
+                    checkpoint.digest,
+                    checkpoint.tokensBefore,
+                    checkpoint.tokensAfter,
+                    checkpoint.createdAt,
+                )
+            },
             heads: async (agentId) =>
                 new Map(
                     q.headList
@@ -1465,6 +1524,8 @@ export class SqliteStore implements Store {
                 // that drops either hands the next turn an orphaned trace.
                 return rows.map(toChatMessage)
             },
+            historySince: async (agentId, sessionKey, afterId) =>
+                q.historySince.all<MessageRow>(agentId, sessionKey, afterId).map(toMessage),
             page: async (agentId, sessionKey, options) => {
                 const limit = options?.limit ?? DEFAULT_PAGE
                 const rows =

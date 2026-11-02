@@ -378,6 +378,13 @@ what the person said, and none touches the current turn's trace (the protected t
 Every stage emits `compaction.stage` with before/after token counts. If `reset` fires more than
 once per session, that's a manifest misconfiguration and `context.reset`'s `warning` says so.
 
+**Checkpoints** (decision 15.21). The ladder rewrites the prompt and never the stored messages, so
+on its own a session over `reset` would re-run it, and re-pay its digest, on every turn. A turn whose
+`reset` fired therefore ends by saving a checkpoint: a digest plus the person's requests, through a
+message id, kept in `session_checkpoints`. The next turn starts from it (`Agent.#promptHistory`) and
+the ladder runs on that. `POST …/sessions/:key/compact` writes one on demand. `messages` keeps every
+row, so the transcript, recall and forgetting never see a checkpoint.
+
 ---
 
 ## Tool layer
@@ -828,6 +835,12 @@ substantially fewer tokens than the equivalent in-context skill in multi-domain 
 
 Handoff failure is a typed result, not an exception. The supervisor decides whether to
 retry, reassign, or surface it.
+
+The same envelope runs an agent's own **subagents** (`subagents:`), children of the agent itself
+with a tool subset. A routed child starts when the harness sees a routed slug; a child declaring
+`spawn: true` is started by the model with `delegate(tasks)`, which runs up to 8 tasks in one call,
+read-only children in parallel (decision 15.20). Both inherit the parent's taint, stand-in deferral,
+participant, policy and cancel, and neither can start a grandchild.
 
 ### Rooms and DMs (Phase 27)
 
