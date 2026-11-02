@@ -193,6 +193,9 @@ and WebSocket surfaces can return:
 | `assignment_requires_admin` | 403 | A participant-bound key assigning an agent when its participant is not an `admin`. |
 | `participant_timezone_invalid` | 400 | `POST /v1/participants` with a `timezone` that is not an IANA zone the runtime knows. |
 | `participant_channel_ids_invalid` | 400 | `channelIds` on `POST /v1/participants` is not a list of `<channel type>:<id or handle>` strings. Nothing was written. |
+| `session_key_required` | 400 | `POST /sessions/resolve` without a `sessionKey`. |
+| `session_too_short` | 409 | `POST /sessions/:key/compact` on a session with nothing older than the turns it keeps. Nothing was written. |
+| `compact_keep_invalid` | 400 | `keepTurns` is not a whole number of at least 1. |
 | `session_not_rotatable` | 409 | `POST /sessions/rotate` on an agent whose `sessions.scope` is `channel-peer`, by a sender with no conversation of their own, or with a key minted for a session prefix and speaking for nobody. Nothing changed. |
 | `backup_requires_unscoped_key` | 403 | `GET /v1/backup` with a key scoped to some agents: a backup holds every agent's data. |
 | `backup_include_invalid` | 400 | `GET /v1/backup?include=` names something other than `env`, `git` or `home`. |
@@ -1063,7 +1066,9 @@ here that the server does not register, or a registered route missing from here,
 | `POST /v1/agents/:id/schedules/:sid/run` | `write` |
 | `DELETE /v1/agents/:id/sessions/:key` | `write` |
 | `POST /v1/agents/:id/sessions/:key/phase` | `write` |
+| `POST /v1/agents/:id/sessions/:key/compact` | `write` |
 | `POST /v1/agents/:id/sessions/:key/recall` | `write` |
+| `POST /v1/agents/:id/sessions/resolve` | `chat` |
 | `POST /v1/agents/:id/sessions/rotate` | `chat` |
 | `POST /v1/agents` | `admin` |
 | `POST /v1/agents/:id/reload` | `admin` |
@@ -1160,7 +1165,9 @@ GET    /v1/agents/:id/sessions/:key
 GET    /v1/agents/:id/sessions/:key/messages?before=&limit=
 DELETE /v1/agents/:id/sessions/:key          → clears history; keeps memory files
 POST   /v1/agents/:id/sessions/:key/phase    → { sessionKey, phase }
+POST   /v1/agents/:id/sessions/:key/compact  { keepTurns? } → { sessionKey, before, after, digest, keptTurns }
 POST   /v1/agents/:id/sessions/:key/recall   { recall } → { sessionKey, recall }
+POST   /v1/agents/:id/sessions/resolve       { sessionKey, from? } → { requested, sessionKey }
 POST   /v1/agents/:id/sessions/rotate        { from? } → { sessionKey, previous }
 ```
 
@@ -1171,8 +1178,24 @@ session_not_rotatable` for a `channel-peer` agent, a sender with no conversation
 key minted for a session prefix speaking for nobody. A key bound to participant P reaches
 `owner:P`, `peer:P` and their rotations (`<base>~` plus six symbols) beside its own prefix.
 
+`resolve` answers which conversation a message naming `sessionKey` (and `from`) would run in, by the
+rule `POST /messages` applies before its `202`, and changes nothing. A client that follows a turn's
+events by session key resolves first: under `sessions.scope: owner` a terminal's or a script's own key
+runs in `owner:<P>`, and filtering on the key it sent drops the whole reply (the 0.2.2 `run --plain`
+defect).
+
 `DELETE` clears conversation state only. Memory markdown is a file artifact and is never
 deleted by an API call.
+
+`compact` (decision 15.21, `docs/25-SPEC-FAN-OUT.md`) folds everything before the last `keepTurns`
+turns (default 2) into a digest plus the person's requests, verbatim, and saves it as the session's
+**checkpoint**: the next turn starts from it instead of the whole history. `digest` says whether a
+declared `model.compactor` wrote it or it was built without a model. `before` and `after` are the
+estimated tokens a turn would start from. It waits for a turn running in that session. Every message
+stays stored, so `messages` pages, recall and `memory_forget` are unchanged; `DELETE` removes the
+checkpoint with the history. A turn whose compaction ladder reached `reset` saves one by itself,
+keeping that turn. A listed session carries `compactedAt` once it has a checkpoint. `409
+session_too_short` when nothing is older than the kept turns; an unknown session is `404`.
 
 `recall` (pilot.10) keeps a conversation's history and takes it out of `memory.includeHistory`
 recall: `false` drops its passages at once and keeps them out of later index passes; `true` puts it
@@ -1492,8 +1515,8 @@ stream still ends on its own turn's `turn.end`, so read `turnId` before treating
 | `agent.channel.status` | connect/disconnect, or a channel now waiting on a person | `channelId`, `channelType`, `status` (`starting` \| `connected` \| `disconnected` \| `error` \| `needs_input`), `detail?`, `input?` (`{kind, payload, issuedAt, expiresAt?}`, present only with `needs_input`) |
 | `agent.channel.error` | channel failure that did not stop the channel | `channelId`, `code`, `message`, `hint` |
 | `agent.channel.rejected` | inbound not turned into a turn | `channelId`, `reason` (`duplicate` \| `denied`), `sender`, `detail` |
-| `handoff.start` | a delegation began | `member`, `task`, `sessionKey`, `kind` (`member` or `self` for a subagent), `name?` (the subagent's), `callId?` (the parent's tool call) |
-| `handoff.result` | how it ended | `member`, `sessionKey`, `kind`, `name?`, `callId?`, `outcome`, `steps`, `tokens`, `errorCode?` |
+| `handoff.start` | a delegation began | `member`, `task`, `sessionKey`, `kind` (`member` or `self` for a subagent), `name?` (the subagent's), `callId?` (the parent's tool call), `index?` and `label?` (a `delegate` task's position in its call, from 0, and the label the model gave it) |
+| `handoff.result` | how it ended | `member`, `sessionKey`, `kind`, `name?`, `callId?`, `index?`, `label?`, `outcome`, `steps`, `tokens`, `errorCode?` |
 | `peer.ask` | an `ask_agent` call began (`24-SPEC-PEER-ASK.md`) | `askId`, `peer`, `remote`, `sessionKey`, `callId?` |
 | `peer.answer` | how it ended | `askId`, `peer`, `sessionKey`, `outcome` (`ok`, `budget`, `error`), `steps`, `tokens`, `errorCode?` |
 | `approval.requested` | a call is waiting on a person | `approvalId`, `slug`, `callId`, `match?`, `mutating`, `reason` |
@@ -1503,6 +1526,7 @@ stream still ends on its own turn's `turn.end`, so read `turnId` before treating
 | `context.pressure` | per step, after compaction | `fraction` (of the prompt actually sent), `tokens`, `budget`, `source: reported \| corrected \| estimated`, `peak?` (what the ladder faced) |
 | `compaction.stage` | per stage that ran | `stage`, `before`, `after`, `changed`, `digest?: model \| mechanical` |
 | `context.reset` | per S5 firing | `count`, `warning?` |
+| `session.compacted` | a session checkpoint was written (`POST …/compact`, or after a turn whose `reset` fired) | `before`, `after` (estimated tokens a turn starts from), `digest: model \| mechanical`, `keptTurns` |
 | `context.dropped` | history the budget could not fit | `messages`, `budget`, `keptTokens` |
 | `phase.changed` | per `phase_set` that moved | `to`, `tools` (count now visible) |
 | `model.call` | request sent | `callId`, `role`, `model`, `promptTokens`, `cached` (always false; the cache hit is on `model.result`), `attempt` |

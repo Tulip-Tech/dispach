@@ -136,7 +136,8 @@ Built and in use:
   models, vision input, and replayed signed thinking.
 - **Channels and tools:** Telegram and WhatsApp (the latter a bundled plugin, with a warning;
   [see below](#whatsapp)), the plugin API with all four middleware wrap points, system and web
-  tool providers under a policy engine, remote MCP servers, and subagents.
+  tool providers under a policy engine, remote MCP servers, and subagents, routed by the harness or
+  started by the model with `delegate` to fan research out in parallel.
 - **Coordination and delivery:** supervisor delegation with typed handoffs, and an idempotent
   outbox.
 - **Front ends and hosting:** a browser UI on the same origin as the API, the TUI, launchd
@@ -181,7 +182,8 @@ The ones that would otherwise look like mistakes:
 - **Tools are pinned at load, not searched at runtime.** Search-then-execute is two-hop
   reasoning, which is where small models fail.
 - **Compaction is progressive and harness-driven** — five stages from 60% context pressure,
-  not one lossy summarise at 95%.
+  not one lossy summarise at 95%. A long conversation is checkpointed, so it stops paying for its
+  compaction on every turn, and can be compacted on demand.
 - **Memory is SQLite FTS5, not embeddings.** No model weights, no embedding service, no
   network in the memory path.
 - **Zero network I/O before readiness.** Channels connect after `runtime.ready` and report

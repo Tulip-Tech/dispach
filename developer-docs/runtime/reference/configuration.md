@@ -16,7 +16,7 @@
 | `channels` | Transport configuration and inbound allowlists |
 | `delivery` | Default and named outbound routing targets |
 | `team` | Members a supervisor agent delegates to |
-| `subagents` | Throwaway children of the same agent that tool calls are routed to |
+| `subagents` | Throwaway children of the same agent: started for routed tool calls, or by the model with `delegate` when a child declares `spawn: true` |
 | `media` | Transcription, image generation, and spoken replies (experimental in 0.2.0) |
 | `standIn` | Answering for a member while they are away (experimental in 0.2.0) |
 | `delegation` | Delegation between members' agents (experimental in 0.2.0) |

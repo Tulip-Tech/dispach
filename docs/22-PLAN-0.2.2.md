@@ -55,3 +55,19 @@ turn replay, a schedule's last outcome and the template vars editor. Moeen chose
 in 0.2.2 rather than move them to 0.3.0 issues, and they landed on `release/0.2.2`. Two needed the
 wire to say more: `GET /v1/agents/:id/vars` (the read half of `PATCH`) and `capabilities` on
 `GET /v1/agents/:id`. Decision 15.18 records the one decision the plan named and nobody wrote.
+
+## Phase 37 — fan-out subagents and session checkpoints (0.2.3)
+
+Spec: `25-SPEC-FAN-OUT.md`. Decisions 15.20, 15.21. Issue #99, asked for by VelaCrew. `subagents[].spawn`
+and the core tool `delegate(tasks[])`: up to 8 tasks per call, each in a fresh child, read-only children
+in parallel up to `limits.maxParallelTools`, one section per task back to the parent. Migration 35
+(`session_checkpoints`), `POST …/sessions/:key/compact`, `session.compacted`, `compactedAt` on a listed
+session, and the automatic checkpoint after a turn whose `reset` fired. The console's compact button and
+per-task blocks in both transcripts.
+
+**Non-goals.** Grandchildren. A child that talks to the person or asks back. Rewriting or deleting
+stored messages. A TUI `/compact` and expanding a child's steps in the TUI beyond the existing ⌥r fold.
+
+**Acceptance.** `25-SPEC-FAN-OUT.md` § Acceptance; `delegate.test.ts` and `checkpoint.test.ts`, each
+revert-checked (concurrency, the automatic save).
+

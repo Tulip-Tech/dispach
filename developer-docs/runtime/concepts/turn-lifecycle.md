@@ -17,7 +17,7 @@ resolve agent and session
 
 The HTTP message endpoint returns `202` after the turn has been accepted. Execution continues independently. The runtime records lifecycle and tool events while the turn is live and persists its final status and text.
 
-Limits in the manifest bound steps, time, output, and context pressure. When context approaches its threshold, the harness applies progressive compaction rather than waiting for one emergency summary. Pinned instruction blocks survive every stage.
+Limits in the manifest bound steps, time, output, and context pressure. When context approaches its threshold, the harness applies progressive compaction rather than waiting for one emergency summary. Pinned instruction blocks survive every stage. When the last stage replaces the history with a digest, that digest is saved as the session's checkpoint, so later turns start from it instead of compacting the whole conversation again; `POST /v1/agents/:id/sessions/:key/compact` saves one on demand. Every message stays stored.
 
 ## Completion
 

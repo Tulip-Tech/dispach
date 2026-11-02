@@ -2,7 +2,22 @@
 
 ## Unreleased
 
-_Nothing yet._
+### Added
+
+- `delegate`: the model can fan out up to 8 tasks to its own subagents in one call, each in a fresh context, and gets one finding back per task. Opt-in per child with `subagents[].spawn: true` (`route` becomes optional). Read-only children run in parallel up to `limits.maxParallelTools`; a child that can write runs its tasks one at a time. Decision 15.20, `docs/25-SPEC-FAN-OUT.md`.
+- `POST /v1/agents/:id/sessions/:key/compact {keepTurns?}` folds a conversation's older turns into a saved checkpoint (a digest plus the person's requests) that the next turn starts from; every message stays stored. A turn whose compaction reached `reset` saves one by itself, so a long session stops re-running its compaction every turn. New event `session.compacted`; sessions list `compactedAt`. Decision 15.21.
+- `@dispach/client`: `compactSession` and `resolveSessionKey`. Web console: a **compact** button on a conversation, and one labelled block per `delegate` task under the tool row (the terminal draws the same).
+- `handoff.start` and `handoff.result` carry `index` and `label` for a `delegate` task.
+
+### Fixed
+
+- `dispach run --plain` printed no reply for an agent with `sessions.scope: owner` (what `init` writes) unless the owner's conversation already existed and was named. The server runs a terminal's turn in `owner:<you>` and the CLI followed the key it had sent. The CLI now asks which conversation a turn will run in first, through the new `POST /v1/agents/:id/sessions/resolve`, in both the attached and embedded paths; an older host without the route keeps the old behaviour.
+- `run` no longer prints "a session store exists at X from an earlier version … the default is now X" when the two are the same file.
+
+### Upgrading from 0.2.2
+
+- Store migration 35 (`session_checkpoints`) runs on first boot, with no down-migration. Back up `store.db` first, or take `GET /v1/backup`.
+- A long session whose compaction reaches `reset` now starts its next turns from a saved checkpoint instead of the full history. The transcript and `GET …/messages` are unchanged.
 
 ## 0.2.2 — 2026-10-30
 
