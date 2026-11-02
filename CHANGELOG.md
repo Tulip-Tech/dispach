@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+_Nothing yet._
+
+## 0.2.3 — 2026-11-02
+
 ### Added
 
 - `delegate`: the model can fan out up to 8 tasks to its own subagents in one call, each in a fresh context, and gets one finding back per task. Opt-in per child with `subagents[].spawn: true` (`route` becomes optional). Read-only children run in parallel up to `limits.maxParallelTools`; a child that can write runs its tasks one at a time. Decision 15.20, `docs/25-SPEC-FAN-OUT.md`.
