@@ -139,6 +139,22 @@ for (const file of siteFiles) {
     }
 }
 
+// The search index ids each page's headings `<page url>-<n>`, so a page whose path is another's plus
+// `-<number>` (`whats-new-0-2` beside `whats-new-0-2-0`) makes `/api/search` throw
+// DOCUMENT_ALREADY_EXISTS in production — every query, while every page still renders.
+const routes = allPages
+    .filter((page) => !page.endsWith("SUMMARY.md"))
+    .map((page) => relative(DOCS, page).replace(/(?:\/README)?\.md$/, ""))
+for (const route of routes) {
+    const clash = routes.find(
+        (other) => other !== route && new RegExp(`^${route}-\\d+$`).test(other),
+    )
+    if (clash !== undefined)
+        failures.push(
+            `developer-docs/${route} and developer-docs/${clash} collide in the search index (heading ids are <url>-<n>); rename one`,
+        )
+}
+
 // The landing page's primary button must lead to the page that installs what the hero shows.
 const landing = readFileSync(join(ROOT, "site/app/(home)/page.tsx"), "utf8")
 const quickstart = /const QUICKSTART = "([^"]+)"/.exec(landing)?.[1]
