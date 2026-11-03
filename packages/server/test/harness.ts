@@ -16,9 +16,17 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { type BuiltInPlugins, Runtime } from "@dispach/core"
 import type { ApprovalRegistry } from "../src/approvals.ts"
-import { createHandler, type Provisioner, type SecretAdmin } from "../src/handler.ts"
+import {
+    type ChannelAdmin,
+    createHandler,
+    type Provisioner,
+    type SecretAdmin,
+    type ServerHandler,
+} from "../src/handler.ts"
 import type { ClaimTicket } from "../src/keys.ts"
+import { declaredResponses, type RouteRef } from "../src/openapi.ts"
 import type { Principal } from "../src/principal.ts"
+import { Router } from "../src/router.ts"
 
 export const TOKEN = "test-token-abcdef"
 export const ENV = { MODEL_API_KEY: "sk-test" }
@@ -146,6 +154,75 @@ export function recordingFetch(replies: readonly string[]): {
     return { fetch: doFetch, bodies, prompts }
 }
 
+/**
+ * The OpenAPI document's response contract, enforced on every response a test provokes.
+ *
+ * The document declares, per route, which statuses it answers and the body each carries. Without
+ * this, that declaration is a description nothing reads — the shape `@dispach/client` was in, whose
+ * `.json() as T` lets `tsc` believe any type. So every handler built here is wrapped: a response
+ * whose route declares a schema for its status must parse against it, a failure must parse as the
+ * one error envelope, and a status the route does not declare at all is a failing test. Matching
+ * goes through a `Router` built from the handler's own table, so precedence is the real router's.
+ *
+ * `HEAD` and `OPTIONS` are skipped (no body, and answered from the table at dispatch), and a path
+ * no documented route matches — a plugin's, a 404, a 405 — passes through unchecked.
+ */
+export function contractChecked(handler: ServerHandler): ServerHandler {
+    let table: Router<RouteRef> | undefined
+    const checked = async (request: Request): Promise<Response> => {
+        const response = await handler(request)
+        const method = request.method.toUpperCase()
+        if (method === "HEAD" || method === "OPTIONS") return response
+        if (table === undefined) {
+            table = new Router<RouteRef>()
+            for (const route of handler.routes()) {
+                table.add(route.method, route.pattern, route, { capability: route.capability })
+            }
+        }
+        const match = table.match(method, new URL(request.url).pathname)
+        if (match.kind !== "found") return response
+        const route = match.handler
+        const declared = declaredResponses(route)
+        if (declared === undefined) return response
+
+        const where = `${route.method} ${route.pattern}`
+        const entry = declared[String(response.status)]
+        if (entry === undefined) {
+            throw new Error(
+                `${where} answered ${response.status}, which its OpenAPI entry does not declare (declared: ${Object.keys(declared).join(", ")}). Body: ${await response.clone().text()}`,
+            )
+        }
+        const type = response.headers.get("content-type") ?? ""
+        if (type.includes("application/json")) {
+            if (entry.json === undefined) {
+                throw new Error(
+                    `${where} answered ${response.status} as JSON, which it declares as ${entry.media ?? "having no body"}.`,
+                )
+            }
+            const body: unknown = await response.clone().json()
+            const parsed = entry.json.safeParse(body)
+            if (!parsed.success) {
+                throw new Error(
+                    `${where} answered ${response.status} with a body its declared schema refuses: ${parsed.error.message}\nBody: ${JSON.stringify(body)}`,
+                )
+            }
+        } else if (entry.media !== undefined && !type.includes(entry.media)) {
+            throw new Error(
+                `${where} answered ${response.status} as "${type}", which it declares as ${entry.media}.`,
+            )
+        } else if (entry.media === undefined && entry.json !== undefined) {
+            throw new Error(
+                `${where} answered ${response.status} as "${type}", which it declares as JSON.`,
+            )
+        }
+        return response
+    }
+    return Object.assign(checked, {
+        authenticate: handler.authenticate,
+        routes: handler.routes,
+    })
+}
+
 export async function harness(
     options: {
         token?: string
@@ -189,6 +266,8 @@ export async function harness(
         provision?: Provisioner
         /** The credential writer `GET`/`PUT /v1/agents/:id/secrets` need. Omitted means `501`. */
         secrets?: SecretAdmin
+        /** The channel actions `PATCH …/channels/:channelId` and `…/unpair` need. Omitted means `501`. */
+        channels?: ChannelAdmin
         /** Plugins a manifest may name by spec, the way the CLI supplies its first-party ones. */
         builtInPlugins?: BuiltInPlugins
         /** Workspace files beside the manifest, written before the runtime boots. */
@@ -212,20 +291,23 @@ export async function harness(
         ...(options.builtInPlugins === undefined ? {} : { builtInPlugins: options.builtInPlugins }),
         ...(options.approvals === undefined ? {} : { approve: options.approvals.approver }),
     })
-    const handler = createHandler({
-        runtime,
-        ...(options.token === undefined
-            ? { allowUnauthenticated: true }
-            : { token: options.token }),
-        ...(options.running === undefined ? {} : { running: options.running }),
-        ...(options.claim === undefined ? {} : { claim: options.claim }),
-        ...(options.origin === undefined ? {} : { origin: options.origin }),
-        ...(options.resolveAgent === undefined ? {} : { resolveAgent: options.resolveAgent }),
-        ...(options.provision === undefined ? {} : { provision: options.provision }),
-        ...(options.secrets === undefined ? {} : { secrets: options.secrets }),
-        ...(options.home === undefined ? {} : { home: options.home }),
-        ...(options.approvals === undefined ? {} : { approvals: options.approvals }),
-    })
+    const handler = contractChecked(
+        createHandler({
+            runtime,
+            ...(options.token === undefined
+                ? { allowUnauthenticated: true }
+                : { token: options.token }),
+            ...(options.running === undefined ? {} : { running: options.running }),
+            ...(options.claim === undefined ? {} : { claim: options.claim }),
+            ...(options.origin === undefined ? {} : { origin: options.origin }),
+            ...(options.resolveAgent === undefined ? {} : { resolveAgent: options.resolveAgent }),
+            ...(options.provision === undefined ? {} : { provision: options.provision }),
+            ...(options.secrets === undefined ? {} : { secrets: options.secrets }),
+            ...(options.channels === undefined ? {} : { channels: options.channels }),
+            ...(options.home === undefined ? {} : { home: options.home }),
+            ...(options.approvals === undefined ? {} : { approvals: options.approvals }),
+        }),
+    )
 
     const call = (
         method: string,

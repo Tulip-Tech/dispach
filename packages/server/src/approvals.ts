@@ -8,9 +8,9 @@
  *
  * ## Why not WebSocket
  *
- * The obvious shape for a two-way question is a socket, and `/v1/ws` answers `501` under Node,
- * which has no upgrade path without a dependency. A capability half the supported runtimes cannot
- * reach is not a capability. So the request goes out on the stream every reader already has —
+ * The obvious shape for a two-way question is a socket, and when this was written `/v1/ws` answered
+ * `501` under Node (it works under both runtimes since 0.1.3, `serve.ts`). A capability half the
+ * supported runtimes could not reach was not a capability. So the request goes out on the stream every reader already has —
  * emitted by **core**, so the CLI and an audit log see it too — and the answer comes back as an
  * ordinary POST. Nothing here needs a socket in either direction.
  *

@@ -522,6 +522,15 @@ const DOCS_PAGE = `<!doctype html>
 export type ServerHandler = ((request: Request) => Promise<Response>) & {
     /** Resolve a credential without dispatching. `Response` is a refusal. */
     readonly authenticate: (request: Request) => Promise<Principal | Response>
+    /**
+     * The route table, without handlers — what `test/harness.ts` matches a response to, so its
+     * check of every declared response body uses this router's own matching and order.
+     */
+    readonly routes: () => readonly {
+        readonly method: string
+        readonly pattern: string
+        readonly capability: Cap | "open"
+    }[]
 }
 
 export function createHandler(options: HandlerOptions): ServerHandler {
@@ -4897,6 +4906,12 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      */
     return Object.assign(dispatch, {
         authenticate: (request: Request) => resolve(request, "/v1/ws", "read"),
+        routes: () =>
+            router.routes().map(({ method, pattern, capability }) => ({
+                method,
+                pattern,
+                capability,
+            })),
     })
 }
 

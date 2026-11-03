@@ -2098,6 +2098,23 @@ Never claim a performance property without a number in `evals/` and a script to 
   addition" — derive bodies from the schemas, and guard the one hand-written part (a summary per
   route) in **both** directions. A summary for a route nothing registers is worse than a missing
   one, because a reference describing an endpoint that answers 404 looks authoritative.
+- **A fact typed twice is a fact that is wrong in one place, and the docs typed every fact twice.** An
+  outside reader found four mistakes on the public site in five minutes: the hero's `npm install` led to
+  a page that built from source; the HTTP reference showed `202 Empty` for the route whose body is the
+  one handle a client must keep, because `openapi.ts` omitted *every* response body on the theory that
+  the client's types were checked (`.json() as T` checks nothing); the API reference was reachable only
+  through the section switcher; and the landing badge, the docs home and the sidebar named three
+  different releases. Everything derived from `packages/cli/package.json` was right and everything typed
+  by hand was stale. So **`scripts/facts.ts` is the one source**: prose carries
+  `<!-- fact:NAME -->value<!-- /fact -->` (version, Node floor, image, endpoint count, console pages, any
+  `default:<manifest.path>`), copyable text is matched by pattern, `bun run release` rewrites both and
+  `docs:check` fails on a stale copy; the history files are exempt because rewriting them would falsify
+  history. The reference now declares response schemas and the server harness parses every response the
+  suite produces against them. Two rules generalise: **an omitted part of a generated document reads as
+  a fact** ("Empty"), never as an omission; and **a new kind of doc fact gets a check, not a promise** —
+  `check-docs.ts` now also fails on a local link that is no site route, a `/docs/…` href in `site/` that
+  names no page, a landing quickstart that never shows the install the hero prints, and an operation with
+  no response body.
 - **Measure a dependency's payload before writing a sentence about it.** I wrote "several hundred
   kilobytes" about Scalar's bundle twice; it is **3.6 MB raw, 1.0 MB gzipped** — sixteen times this
   project's entire UI at 220 KB. The number is what decides CDN versus vendoring, so guessing it

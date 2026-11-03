@@ -507,7 +507,7 @@ function nextSteps(
         answers.skills === "find"
             ? `Add more skills: \`${BRAND.slug} sources search <what it should do>\` ranks every skill in the catalogues, then \`${BRAND.slug} skills install ${runRef} <source>/<skill>\`.`
             : answers.skills === "starter"
-              ? `Fill in workspace-level skills/starter/SKILL.md, or take a real one — \`${BRAND.slug} sources search <what it should do>\` searches 440+ from two catalogues.`
+              ? `Fill in workspace-level skills/starter/SKILL.md, or take a real one — \`${BRAND.slug} sources search <what it should do>\` searches the configured catalogues.`
               : `Skills are off but the directory is there — \`${BRAND.slug} sources search <what it should do>\` finds one, \`${BRAND.slug} skills new ${runRef} <name>\` writes one.`,
     )
     steps.push(

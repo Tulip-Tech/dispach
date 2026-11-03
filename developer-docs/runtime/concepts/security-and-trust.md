@@ -18,7 +18,7 @@ The floor is measured in a preprint, Hossain and Mahmud, 2026, [*What May an Age
 
 Tool results declare their trust level. Delimiters help a model distinguish untrusted content, but they are advisory. The write gate is the enforcement point: by default, a turn influenced by untrusted tool output cannot mutate state.
 
-Messages declared as coming from another agent are fenced as data and run with mutating tools blocked. A caller cannot separately mark such a message trusted.
+A message sent with `from.kind: "agent"` is fenced as data and its turn starts tainted, so the write gate applies from the first step. What the gate does is `tools.untrusted.onMutate`: `refuse` (the default) blocks the mutating call, `confirm` asks an approver, and `allow` lets it run. A caller cannot separately mark such a message trusted.
 
 ## Secrets and code
 

@@ -11,7 +11,7 @@
  * `attachWebSocket` bridge, so the two runtimes cannot disagree about a frame.
  */
 
-import { HarnessError } from "@dispach/core"
+import { BRAND, HarnessError } from "@dispach/core"
 import { createHandler, type HandlerOptions, type ServerHandler } from "./handler.ts"
 import { isLoopback, originProblem } from "./origin.ts"
 import { HEARTBEAT_MS } from "./sse.ts"
@@ -60,7 +60,7 @@ export async function serve(options: ServeOptions): Promise<RunningServer> {
         throw new HarnessError({
             code: "server_public_without_token",
             message: `Refusing to bind ${host}:${port} with no API token.`,
-            hint: "Set the variable named by server.tokenEnv, or bind 127.0.0.1. A public bind with no token exposes every endpoint — including the ones that start a turn — to anyone who can reach the port, and behaves identically to a safe one until someone finds it.",
+            hint: `Set ${BRAND.envPrefix}API_TOKEN (or the variable a manifest names in server.tokenEnv instead), or bind 127.0.0.1. A public bind with no token exposes every endpoint — including the ones that start a turn — to anyone who can reach the port, and behaves identically to a safe one until someone finds it.`,
             field: "server.host",
         })
     }

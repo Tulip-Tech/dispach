@@ -13,7 +13,7 @@ before installing.
 
 ## Install the line you intend to test
 
-Install the stable CLI through the default npm tag:
+Install the stable CLI (Node <!-- fact:node -->24<!-- /fact -->+) through the default npm tag:
 
 ```bash
 npm install --global dispach@latest
@@ -41,5 +41,6 @@ included in the published `dispach` npm package. Run it from a matching reposito
 the silo image to the same version.
 
 Pre-release APIs can change between revisions. Review the notes for each one and the `Unreleased`
-section of `CHANGELOG.md` before upgrading. In 0.2.0 the multiplayer surfaces (rooms, stand-ins,
-team memory, peer ask) are experimental: on the HTTP API only, and they may change within 0.2.x.
+section of `CHANGELOG.md` before upgrading. In 0.2.x the multiplayer surfaces (rooms, stand-ins,
+team memory, peer ask) are experimental: on the HTTP API and the web console, and they may change
+within 0.2.x.

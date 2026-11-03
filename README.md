@@ -25,7 +25,7 @@ agent and streams its reply in three requests.
 
 ```bash
 docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach \
-  -e DISPACH_API_TOKEN=pick-a-secret ghcr.io/moeen-mahmud/dispach:0.2.2
+  -e DISPACH_API_TOKEN=pick-a-secret ghcr.io/moeen-mahmud/dispach:0.2.3
 ```
 
 The named volume is where the store, every agent and every key live; without it a `docker rm` for
@@ -43,15 +43,15 @@ reattachable, every write takes an idempotency key, and the wire contract is pub
 and checked in CI. One process hosts many agents, and scoped keys fence each one off. TypeScript,
 shipped on Node, Apache-2.0.
 
-**Where it is going: the multiplayer agent runtime.** 0.2.0 gives every user and every team in your
+**Where it is going: the multiplayer agent runtime.** 0.2.x gives every user and every team in your
 product their own isolated runtime of agents. Those agents share rooms and memory with the people
-they work for, and stand in for them, openly, when they are away. That half ships in 0.2.0 as
+they work for, and stand in for them, openly, when they are away. That half ships in 0.2.x as
 **experimental**: on the HTTP API and the browser console (no TUI screens yet), and it may change within 0.2.x.
 Everything else described in this README is stable.
 
 **Docs:** [dispach.blivius.com/docs](https://dispach.blivius.com/docs) ·
-**New in 0.2.2:** [the changelog, with upgrade notes](CHANGELOG.md) ·
-**New in 0.2.0:** [what changed and how to upgrade](developer-docs/runtime/whats-new-0-2-0.md) ·
+**New in <!-- fact:version -->0.2.3<!-- /fact -->:** [the changelog, with upgrade notes](CHANGELOG.md) ·
+**New since 0.2.0:** [what each release added](developer-docs/runtime/whats-new-since-0-2-0.md) ·
 **Limits:** [what is measured, and what it does not do](developer-docs/runtime/limits-and-evidence.md)
 
 **Contributing:** start with a [good first issue](https://github.com/moeen-mahmud/dispach/labels/good%20first%20issue)
@@ -69,7 +69,7 @@ or the [larger pieces that need an owner](https://github.com/moeen-mahmud/dispac
 ```bash
 export TOKEN=pick-a-secret
 docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach -e DISPACH_API_TOKEN=$TOKEN \
-  ghcr.io/moeen-mahmud/dispach:0.2.2
+  ghcr.io/moeen-mahmud/dispach:0.2.3
 
 curl -s -H "Authorization: Bearer $TOKEN" localhost:7420/v1/agents \
   -d '{"answers":{"user":"you","name":"milo","apiKey":"sk-…"}}'
@@ -89,8 +89,8 @@ default and choices. To run it from a checkout instead, [Hosting with Compose](#
 has the `docker compose` version.
 
 **[`docs/09-API-GUIDE.md`](docs/09-API-GUIDE.md) is the walkthrough**: provisioning over the wire,
-streaming, reattaching after a dropped connection, approvals and keys. The reference is served at
-`http://localhost:7420/docs`, the contract is [`docs/04-SPEC-WIRE.md`](docs/04-SPEC-WIRE.md), and
+streaming, reattaching after a dropped connection, approvals and keys. The reference is [on the docs site](https://dispach.blivius.com/docs/reference) and served by
+every server at `/docs`, the contract is [`docs/04-SPEC-WIRE.md`](docs/04-SPEC-WIRE.md), and
 `dispach/client` is the typed client. The CLI and the full-screen terminal UI below are the same
 runtime from a terminal.
 
@@ -122,7 +122,7 @@ gap of a few runs is noise. Hermes leads on Gemini 4 Argon and the two small ope
 
 ## Status
 
-**0.2.2**, from npm, Homebrew, the container image or the standalone installer. Every install
+**<!-- fact:version -->0.2.3<!-- /fact -->**, from npm, Homebrew, the container image or the standalone installer. Every install
 runs under Node. [`CHANGELOG.md`](CHANGELOG.md) has what landed in each release.
 
 Built and in use:
@@ -140,11 +140,11 @@ Built and in use:
   started by the model with `delegate` to fan research out in parallel.
 - **Coordination and delivery:** supervisor delegation with typed handoffs, and an idempotent
   outbox.
-- **Front ends and hosting:** a browser UI on the same origin as the API, the TUI, launchd
+- **Front ends and hosting:** a browser console on the same origin as the API (per agent: <!-- fact:console:agent -->Chat, Models, Team, Tools, Schedules, Channels, Turns, Usage, Files, Settings<!-- /fact -->; for the server: <!-- fact:console:server -->Overview, People, Rooms, Actions, Memory, Usage, Webhooks, Backup, Keys, API<!-- /fact -->), the TUI, launchd
   services, the Docker image with a compose front door, Kubernetes, and `GET /v1/backup` for the
   whole sandbox.
 
-**Experimental in 0.2.0**: rooms, stand-ins and team memory; the Slack, Microsoft Teams and A2A
+**Experimental in 0.2.x**: rooms, stand-ins and team memory; the Slack, Microsoft Teams and A2A
 channels; and media (transcription, image generation, spoken replies). The first three and the
 channels have screens in the browser console since 0.2.2 (People, Rooms, Actions, Memory,
 add a channel); media is still API-only.
@@ -201,7 +201,7 @@ Full rationale for every decision, including the negative ones, is in `docs/00-D
 
 ```bash
 npm i -g dispach          # the `dispach` command
-dispach --version         # 0.2.2
+dispach --version         # 0.2.3
 ```
 
 and in an application that talks to a running server:
@@ -236,7 +236,7 @@ Nothing needs root. Run it again to upgrade.
 
 | Variable | Effect |
 | --- | --- |
-| `DISPACH_VERSION=0.2.2` | that release instead of the latest |
+| `DISPACH_VERSION=0.2.3` | that release instead of the latest |
 | `DISPACH_NO_MODIFY_PATH=1` | change no rc file; it prints the line to add |
 | `DISPACH_INSTALL_DIR=<dir>` | install somewhere other than `~/.dispach` |
 
@@ -263,12 +263,14 @@ naming a formula in full is *itself* what Homebrew accepts as consent to load a 
 `brew install dispach` after a plain `brew tap moeen-mahmud/tap` is the same install and refuses
 until `brew trust moeen-mahmud/tap` is run, because a bare name carries no such consent.
 
-`brew services start dispach` then runs the always-on server; `brew info` prints the rest.
+`brew services start dispach` then runs the always-on server; `brew info` prints the rest. Use it or
+`init`'s background service, not both: pass `--daemon none` to `init`, or two hosts contend for the
+same agents.
 
 ### Or the container
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.2.2
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.3
 ```
 
 The [Docker](#docker) and [Compose](#hosting-with-compose) sections below have the run lines and
@@ -287,7 +289,7 @@ bun run build                       # builds every package the binary imports
 cd packages/cli && bun link         # puts `dispach` on your PATH
 cd ../..
 
-dispach --version                   # 0.2.2
+dispach --version                   # 0.2.3
 dispach --help
 ```
 
@@ -301,7 +303,7 @@ Four things that are not obvious:
   every provider package — tools, channels, the Bedrock transport, media — from their `dist`
   (`packages/cli/src/lib/providers.ts` is the list), so building only `core` and `cli` leaves the binary running yesterday's provider code — and the symptom is the
   worst kind: your change is correct, a test fails, and the stack trace points into a stale `dist`.
-- **Node 24+ must be on your `PATH`.** The built entry's shebang is `#!/usr/bin/env node`; Bun builds
+- **Node <!-- fact:node -->24<!-- /fact -->+ must be on your `PATH`.** The built entry's shebang is `#!/usr/bin/env node`; Bun builds
   it and Node runs it — the same runtime every install ships.
 - **`DISPACH_HOME` relocates the whole sandbox.** Point it at a temporary directory and every agent,
   the store and the logs go there instead of `~/.dispach` — which is how to try things out, and how
@@ -466,8 +468,8 @@ dispach stop milo       # or just one
 
 It asks each process to stop rather than killing it, because the graceful path is the only one that
 reaps commands the agent left running in the background, and it *disables* each service as well as
-unloading it — a safety switch that came back at the next login would not be one. `daemon start`
-brings an agent back.
+unloading it — a safety switch that came back at the next login would not be one. `dispach start
+milo` switches an agent back on, and `daemon start` loads a stopped service again.
 
 A configuration error stops the service **once** rather than restarting it forever — the generated
 job restarts on a crash signal and on nothing else, so a missing token leaves a stopped service and
@@ -480,7 +482,7 @@ manifest — which `init` writes `0600` — and the plist carries only `HOME`, `
 variables.
 
 **Linux and containers.** On Linux `daemon install` writes a systemd **user** unit and prints the
-two commands that start it — it does not run them, because nothing in this project's test
+three commands that start it (`daemon-reload`, `enable --now`, `enable-linger`) — it does not run them, because nothing in this project's test
 environment can execute `systemctl`, and a unit nobody has started is how a "supported" platform
 turns out not to be. Mind `loginctl enable-linger`, or the unit stops with your last session. In a
 container, the image's own `serve` is the process and the container runtime supervises it — it
@@ -650,14 +652,14 @@ consequence: run it on a laptop and the policy is the only boundary there is.
 ## Docker
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.2.2          # or build it: docker build -f docker/Dockerfile -t dispach .
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.3          # or build it: docker build -f docker/Dockerfile -t dispach .
 cp examples/minimal/.env.example examples/minimal/.env  # then MODEL_API_KEY; only the example is tracked
 docker run --rm --init -p 7420:7420 \
   --env-file examples/minimal/.env \
   -e DISPACH_API_TOKEN=pick-something \
   -v "$PWD/examples/minimal:/agent" \
   -v dispach-home:/home/dispach \
-  ghcr.io/moeen-mahmud/dispach:0.2.2
+  ghcr.io/moeen-mahmud/dispach:0.2.3
 ```
 
 The token is not optional and is not boilerplate. The image binds `0.0.0.0`, because a process
@@ -720,7 +722,7 @@ bun run bench:boot   # must stay under 1000 ms
 bun run bench:schedule  # 100 schedules on one timer — reports drift, does not assert it
 ```
 
-Bun is the development toolchain: install, build and test. Everything shipped runs under Node 24+.
+Bun is the development toolchain: install, build and test. Everything shipped runs under Node <!-- fact:node -->24<!-- /fact -->+.
 
 A few house rules that bite first, all enforced by tests rather than review:
 
