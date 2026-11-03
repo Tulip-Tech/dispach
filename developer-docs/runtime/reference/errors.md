@@ -1,6 +1,6 @@
 # Errors
 
-API failures use a stable machine-readable code and a human-readable message. Runtime errors also carry a `hint` that explains the likely corrective action.
+Every API failure has a stable machine-readable `code`, a human-readable `message`, and a `hint` that explains the likely corrective action. A failure about one request field also names it in `field`.
 
 ```json
 {
@@ -14,11 +14,13 @@ API failures use a stable machine-readable code and a human-readable message. Ru
 
 Treat `code` as the application branch and `message` or `hint` as diagnostic text. Do not parse prose.
 
+This page does not list every code. The [generated HTTP API](../../reference/README.md) names the code each invalid request field produces; codes from the runtime itself are defined beside the code that raises them.
+
 | HTTP status | Typical action |
 | --- | --- |
 | `400` | Fix the request shape, an invalid field, or a configuration that fails validation |
 | `401` | Supply a valid operator key |
-| `403` | Use a key with the required scope or change policy |
+| `403` | Use a key whose `can` includes the capability the route needs. A key scoped away from an agent gets `404`, not `403`, so a refusal does not confirm the agent exists |
 | `404` | Refresh the addressed agent, turn, session, or resource |
 | `409` | Resolve state conflict; do not blindly overwrite or duplicate work |
 | `429` | Back off or address configured capacity and token limits |

@@ -12,11 +12,11 @@ The system provider supplies shell and file access outside core. Its policy eval
 
 ## Skills
 
-Skills package instructions and supporting resources. The harness selects relevant skills and injects them under a budget; it does not depend on a model deciding to browse a directory. Validate third-party skills before placing them in a catalogue available to agents.
+Skills package instructions and supporting resources. The harness ranks skills against each turn's input and injects the best matches; it does not depend on a model deciding to browse a directory. At most `skills.maxActive` (default <!-- fact:default:skills.maxActive -->1<!-- /fact -->) skills activate per turn, and only above `skills.threshold` (default <!-- fact:default:skills.threshold -->0.35<!-- /fact -->, a normalised BM25 score). There is no token budget: the catalogue shows each skill's size, and `skills validate` warns above 5,000 tokens. `skills.trusted` limits whose scripts become tools. Validate third-party skills before placing them in a catalogue available to agents.
 
 ## Plugins
 
-Plugins extend channels, tools, lifecycle hooks, and middleware through the public plugin API. They run as trusted code in the runtime process. Install them at boot through the manifest; runtime package installation is deliberately unsupported. Writing one in 0.2.0 needs a repository checkout, because the plugin types are in a private workspace package rather than the published `dispach` package.
+Plugins extend channels, tools, lifecycle hooks, and middleware through the public plugin API. They run as trusted code in the runtime process. Install them at boot through the manifest; runtime package installation is deliberately unsupported. Writing one in 0.2.x needs a repository checkout, because the plugin types are in a private workspace package rather than the published `dispach` package.
 
 First-party plugins use the same public contracts as external plugins. If an integration cannot be expressed through those contracts, improve the contract instead of reaching into core internals.
 

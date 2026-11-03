@@ -216,7 +216,7 @@ function unconfigured(options: SkillsOptions): number {
     // recommending the manual edit.
     process.stdout.write(
         "this agent has no skills configured\n\n" +
-            "  · find one and install it — searches the catalogues, 440+ skills:\n" +
+            "  · find one and install it — searches the configured catalogues for skills:\n" +
             "      sources search <what it should do>\n" +
             `      skills install ${options.manifestPath} <source>/<skill>\n\n` +
             "  · or write your own from a template:\n" +
@@ -264,7 +264,7 @@ function list(
 
     if (skills.length === 0) {
         process.stdout.write(
-            `no skills in ${dir}\n\n  \`sources search <what it should do>\` ranks 440+ from the configured catalogues, then\n  \`skills install <agent> <source>/<skill>\`. \`skills new <agent> <name>\` writes one from a template.\n`,
+            `no skills in ${dir}\n\n  \`sources search <what it should do>\` ranks the skills in the configured catalogues, then\n  \`skills install <agent> <source>/<skill>\`. \`skills new <agent> <name>\` writes one from a template.\n`,
         )
         return EXIT_OK
     }

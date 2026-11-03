@@ -25,7 +25,11 @@ dispach config set milo model.main.id gpt-4.1-mini
 dispach config env milo MODEL_API_KEY
 ```
 
-The interactive editor and HTTP configuration endpoint use the same field catalogue. Validation happens before a file is replaced. The HTTP response reports persistence and activation separately: `applied: false` means the file was saved but the running agent could not be replaced, usually because a turn is active. Reload or restart that agent after the turn finishes.
+The interactive editor and HTTP configuration endpoint use the same field catalogue. Validation happens before a file is replaced. The HTTP response reports persistence and activation separately: `applied: false` means the file was saved and the change is not yet in force, and `pending.code` says why:
+
+- `reload_pending`: turns were running. The reload applies by itself once they finish; they complete on the settings they started with. Watch for `agent.reloaded`; nothing needs to be called.
+- `agent_not_running`: the agent is stopped. `POST /v1/agents/:id/start` loads it from the files as they are now.
+- Any other code is the reload refusing the new files, for example a workspace file over budget. Fix the cause, then `POST /v1/agents/:id/reload` or restart the agent.
 
 ## Model endpoint shape
 

@@ -12,7 +12,7 @@ result yet), **fix** (the prose and the evidence disagree), **remove** (no evide
 | Claim | Evidence | Scope | Limitation | Status |
 | --- | --- | --- | --- | --- |
 | Dispach native scores 125/125 on five of the eleven models compared with other harnesses, and 99–100% on eight of fourteen models | `evals/harness/summary.json`, `evals/harness/runs/sweep-4f3e00a/` (2026-10-23) | 25 multi-turn tasks × 5 repeats, tools executed, graded by final state | One benchmark of our own design | verified |
-| Matches or beats Hermes 0.19.0 on 8 of 11 models, and costs the least of the three harnesses on 10 of 11 (level with Hermes on GPT-6.1 Sol) | `evals/harness/summary.json` | Same tasks, isolation and pinned providers for all three harnesses | Rival arms measured 2026-10-22/23, Dispach on 2026-10-23; the 95% intervals of every Dispach–Hermes pair overlap, gpt-oss-20b only just (70–84% against 82–93%) | verified |
+| Matches or beats Hermes 0.19.0 on 8 of 11 models, and costs the least of the three harnesses on 10 of 11 (on GPT-6.1 Sol Hermes is cheaper, $0.5262 against $0.5439) | `evals/harness/summary.json` | Same tasks, isolation and pinned providers for all three harnesses | Rival arms measured 2026-10-22/23, Dispach on 2026-10-23; the 95% intervals of every Dispach–Hermes pair overlap, gpt-oss-20b only just (70–84% against 82–93%) | verified |
 | OpenClaw 2026.10.5 scores lowest on every model, 11–60 runs behind | `evals/harness/summary.json` | As above | Each harness on its own documented defaults | verified |
 | Hermes leads on the small open models: qwen3.5-9b 112 vs 104, gpt-oss-20b 111 vs 97 | `evals/harness/summary.json` | As above | The qwen3.5-9b intervals overlap widely; the gpt-oss-20b ones only just | verified |
 
@@ -59,16 +59,16 @@ result yet), **fix** (the prose and the evidence disagree), **remove** (no evide
 | Rule compliance on a small model | `evals/rules/results.json` holds a qwen3.5:9b run at 0.990; the README says no run finished | — | Which is current is not recorded; the README now says so. Neither is quoted | needs-run |
 | Token-estimate correction: mean error 14.2% uncalibrated, 2.9% with the shipped EMA | `evals/budget/results.json` | deepseek-v4-pro, 31 turns | One endpoint | verified |
 | A model writing a shell script into `exec` damages 25% of multi-line arguments, half silently | `evals/nlt-heredoc/results.json` (2026-09-13) | deepseek-chat, 8 tasks × 2 | A floor on the problem, one endpoint; the backstop false-repairs about a third | verified |
-| Memory retrieval: median 0.34 ms, slowest 3.7 ms over 5,000 passages | `evals/memory/results.json` | No model; FTS5 candidates scored in `rank/bm25.ts` | One machine | verified |
+| Memory retrieval: median 0.34 ms, slowest 3.7 ms over 5,000 passages | `evals/memory/results.json` | No model; FTS5 candidates scored in `packages/core/src/rank/bm25.ts` | One machine | verified |
 | Skill-index scan, 50 skills: cold well under the 50 ms criterion, warm under 5 ms | `evals/skills/results.json` | bun, macOS arm64 | Cold varies with load (5–11 ms measured); quote the criterion, not a point | verified |
 
 ## Safety and agents
 
 | Claim | Evidence | Scope | Limitation | Status |
 | --- | --- | --- | --- | --- |
-| Prompt injection via a fetched page: 0 of 6 cases executed | `evals/web/results.json`, `evals/web/native/results.json`, `evals/web/flash/results.json` (2026-08-15) | deepseek-v4-pro (NLT and native), deepseek-v4-flash | Measures the **model**: the write gate never fired. The gate is proven by `trust.test.ts`, not by this eval. No small model was run | verified |
+| Prompt injection via a fetched page: 0 of 6 cases executed | `evals/web/results.json`, `evals/web/native/results.json`, `evals/web/flash/results.json` (2026-08-15) | deepseek-v4-pro (NLT and native), deepseek-v4-flash | Measures the **model**: the write gate never fired. The gate is proven by `packages/core/test/trust.test.ts`, not by this eval. No small model was run | verified |
 | Agent scenarios: 4 of 4 pass | `evals/scenarios/example/results.json` (2026-09-27) | deepseek-v4-pro judged by deepseek-v4-flash | Only 2 runs | verified |
-| Delegation cuts the parent's prompt by 31.6% | Fixture-only run, no `results.json` | — | Never run against a real endpoint; total tokens went **up** | needs-run |
+| Delegation cuts the parent's prompt by 31.6% | Fixture-only run, no results file | — | Never run against a real endpoint; total tokens went **up** | needs-run |
 | Routing bulk tool work to a subagent pays for itself | `evals/subagents/results.json` is a dry run against canned answers | — | The README says so: mechanics only, pass rates meaningless | needs-run |
 
 ## Self-configuration

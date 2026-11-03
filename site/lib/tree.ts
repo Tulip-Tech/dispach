@@ -56,21 +56,61 @@ function section(dir: string): Folder {
     return folder
 }
 
+/** The reference's first page, where the runtime sidebar's "HTTP API" entry leads. */
+const API_INDEX = byPath.get("reference/README.md")?.url
+
+/**
+ * Every operation, grouped by its resource (`/v1/agents/...` → `agents`), because the whole surface in
+ * one flat list is a list nobody scans. Groups keep the document's order of first appearance.
+ */
 function httpApi(): Folder {
-    const pages = source.getPages().filter((page) => page.type === "openapi")
+    const groups = new Map<string, Item[]>()
+    for (const page of source.getPages().filter((page) => page.type === "openapi")) {
+        const op = page.data.getOpenAPIPageProps().operations?.[0]
+        // A summary is a sentence; `GET /v1/agents` is what a reader scans a sidebar for.
+        const name = op === undefined ? page.data.title : `${op.method.toUpperCase()} ${op.path}`
+        const resource = op?.path.split("/")[2] ?? "other"
+        const items = groups.get(resource) ?? []
+        items.push({ type: "page", name, url: page.url })
+        groups.set(resource, items)
+    }
+    // A resource with one operation (`/v1/health`, `/docs`) is a folder holding one row; those go
+    // together under "server" instead.
+    const server: Item[] = []
+    for (const [resource, items] of groups) {
+        if (items.length > 1 && resource !== "other") continue
+        server.push(...items)
+        groups.delete(resource)
+    }
+    if (server.length > 0) groups.set("server", server)
     return {
         $id: "reference/http",
         type: "folder",
         name: "HTTP API",
         defaultOpen: true,
-        // A summary is a sentence; `GET /v1/agents` is what a reader scans a sidebar for.
-        children: pages.map((page) => {
-            const op = page.data.getOpenAPIPageProps().operations?.[0]
-            const name =
-                op === undefined ? page.data.title : `${op.method.toUpperCase()} ${op.path}`
-            return { type: "page", name, url: page.url }
-        }),
+        children: [...groups].map(([resource, children]) => ({
+            $id: `reference/http/${resource}`,
+            type: "folder",
+            name: resource,
+            children,
+        })),
     }
+}
+
+/**
+ * The HTTP reference lives in its own section, so the runtime's "Runtime reference" group links to
+ * it first: somebody reading the runtime docs must not have to know the section switcher exists.
+ */
+function linkApi(folder: Folder): void {
+    if (API_INDEX === undefined) throw new Error("reference/README.md did not load")
+    const group = folder.children.find(
+        (node): node is Folder => node.type === "folder" && node.name === "Runtime reference",
+    )
+    if (group === undefined) throw new Error('runtime/SUMMARY.md has no "Runtime reference" group')
+    // The anchor is load-bearing: the sidebar shows whichever section is the first to hold the current
+    // URL, so the bare URL here made the reference index open under the runtime sidebar, with the
+    // operations it introduces nowhere on screen. With the anchor, only the reference holds that URL.
+    group.children.unshift({ type: "page", name: "HTTP API", url: `${API_INDEX}#api-reference` })
 }
 
 export const tree: Root = {
@@ -79,6 +119,7 @@ export const tree: Root = {
     children: SECTIONS.map((dir) => {
         const folder = section(dir)
         if (dir === "reference") folder.children.push(httpApi())
+        if (dir === "runtime") linkApi(folder)
         return folder
     }),
 }

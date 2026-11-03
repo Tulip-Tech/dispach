@@ -41,8 +41,8 @@ committed file behind it. A number with no row is not used anywhere.
 
 ## Status
 
-- **Experimental in 0.2.0**, on the HTTP API only, never run against a real tenant or account: rooms,
-  stand-ins and team memory, the Slack, Microsoft Teams and A2A channels, and media. These may change
+- **Experimental in 0.2.x**, never run against a real tenant or account: rooms, stand-ins and team
+  memory (on the HTTP API and the web console), the Slack, Microsoft Teams and A2A channels, and media. These may change
   within 0.2.x.
 - **Endpoints re-verified for 0.2.0:** DeepSeek's API and an open-weight model through OpenRouter. The
   benchmark reaches Claude, GPT and Gemini models through OpenRouter as well; OpenAI's and Anthropic's

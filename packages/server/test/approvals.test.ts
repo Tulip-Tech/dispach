@@ -15,7 +15,14 @@ import { Runtime } from "@dispach/core"
 import { createApprovalRegistry } from "../src/approvals.ts"
 import { createHandler } from "../src/handler.ts"
 import { serve } from "../src/serve.ts"
-import { cleanupWorkspaces, ENV, readUntil, recordingFetch, workspace } from "./harness.ts"
+import {
+    cleanupWorkspaces,
+    contractChecked,
+    ENV,
+    readUntil,
+    recordingFetch,
+    workspace,
+} from "./harness.ts"
 
 afterAll(cleanupWorkspaces)
 
@@ -64,7 +71,9 @@ async function asking(
         // ever raised — which is what every deployment did before this stage.
         approve: approvals.approver,
     })
-    const handler = createHandler({ runtime, allowUnauthenticated: true, approvals })
+    const handler = contractChecked(
+        createHandler({ runtime, allowUnauthenticated: true, approvals }),
+    )
 
     const call = (method: string, path: string, body?: unknown) =>
         handler(
@@ -288,7 +297,7 @@ describe("the ways an approval fails to be answered", () => {
             env: ENV,
             fetch: recordingFetch(["hi"]).fetch,
         })
-        const handler = createHandler({ runtime, allowUnauthenticated: true })
+        const handler = contractChecked(createHandler({ runtime, allowUnauthenticated: true }))
         try {
             const listing = await handler(
                 new Request("http://127.0.0.1:7420/v1/agents/assistant/approvals"),

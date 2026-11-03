@@ -5,7 +5,7 @@ import { capturedAt, capturedModel, replay } from "@/lib/replay"
 import { brand, repoUrl } from "@/lib/shared"
 import { pixels } from "@/lib/wordmark"
 
-const QUICKSTART = "/docs/runtime/quickstart/run-with-docker"
+const QUICKSTART = "/docs/runtime/quickstart/install-and-serve"
 /** The preprint that measures the settings floor. A preprint, not peer-reviewed: say so wherever it is cited. */
 const PAPER = "https://arxiv.org/abs/2610.06274"
 
@@ -61,7 +61,7 @@ const PROOFS = [
         figure: `${evidence.bootMs} ms`,
         title: "Process start to ready",
         body: "No network I/O before readiness, by rule. Channels and remote catalogues connect afterwards and report status as events.",
-        caveat: `Median of 7 boots, ${evidence.bootMachine}. Boot, not response latency. CI fails above 1,200 ms.`,
+        caveat: `Median of ${evidence.bootRuns} boots under ${evidence.bootRuntime}, ${evidence.bootMachine}. Boot, not response latency. CI fails above ${evidence.bootCiFailMs.toLocaleString("en-US")} ms.`,
         href: "/evals",
         link: "Evidence",
     },
@@ -206,6 +206,7 @@ export default function HomePage() {
                     <p className="mt-6 font-mono text-xs text-fd-muted-foreground">
                         <span className="text-term-accent">›</span> npm install --global{" "}
                         {brand.slug}
+                        <span className="ml-2">· Node {evidence.node}+</span>
                     </p>
                 </div>
                 <Replay
@@ -280,8 +281,9 @@ export default function HomePage() {
                         they work for, and stand in for them, openly, when they are away.
                     </p>
                     <p className="mt-2 text-sm text-fd-muted-foreground">
-                        In {evidence.version} it is on the HTTP API only, with no screens yet, and
-                        it may change within 0.2.x. Everything above is stable.
+                        In {evidence.version} it is on the HTTP API and the web console, with no
+                        terminal screens yet, and it may change within {evidence.line}. Everything
+                        above is stable.
                     </p>
                 </div>
             </section>
