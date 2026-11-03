@@ -9,6 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BRAND, Runtime } from "@dispach/core"
 import { type AgentRemover, createHandler } from "../src/handler.ts"
+import { contractChecked } from "./harness.ts"
 
 async function setup(remover: AgentRemover) {
     const dir = mkdtempSync(join(tmpdir(), "remove-"))
@@ -21,7 +22,7 @@ async function setup(remover: AgentRemover) {
         env: { MODEL_API_KEY: "k" },
         store: ":memory:",
     })
-    const handler = createHandler({ runtime, allowUnauthenticated: true, remover })
+    const handler = contractChecked(createHandler({ runtime, allowUnauthenticated: true, remover }))
     const del = (query: string) =>
         handler(new Request(`http://127.0.0.1:7420/v1/agents/doomed${query}`, { method: "DELETE" }))
     return { runtime, del, dir }

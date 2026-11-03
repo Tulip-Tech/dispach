@@ -10,6 +10,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BRAND, type ChannelHost, type OutboundMessage, Runtime } from "@dispach/core"
 import { createHandler } from "../src/handler.ts"
+import { contractChecked } from "./harness.ts"
 
 async function setup() {
     const dir = mkdtempSync(join(tmpdir(), "deliveries-"))
@@ -47,7 +48,7 @@ channels:
             }),
         },
     })
-    const handler = createHandler({ runtime, allowUnauthenticated: true })
+    const handler = contractChecked(createHandler({ runtime, allowUnauthenticated: true }))
     const post = (body: unknown) =>
         handler(
             new Request("http://127.0.0.1:7420/v1/agents/sender/deliveries", {

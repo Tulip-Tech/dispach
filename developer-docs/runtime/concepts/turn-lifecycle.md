@@ -17,7 +17,9 @@ resolve agent and session
 
 The HTTP message endpoint returns `202` after the turn has been accepted. Execution continues independently. The runtime records lifecycle and tool events while the turn is live and persists its final status and text.
 
-Limits in the manifest bound steps, time, output, and context pressure. When context approaches its threshold, the harness applies progressive compaction rather than waiting for one emergency summary. Pinned instruction blocks survive every stage. When the last stage replaces the history with a digest, that digest is saved as the session's checkpoint, so later turns start from it instead of compacting the whole conversation again; `POST /v1/agents/:id/sessions/:key/compact` saves one on demand. Every message stays stored.
+Limits in the manifest bound steps, time, output, and context pressure. When context approaches its threshold, the harness applies progressive compaction rather than waiting for one emergency summary. The five stages run in order of how much they destroy, each at its own share of the window (`context.thresholds`): `snip` (<!-- fact:default:context.thresholds.snip -->0.6<!-- /fact -->) and `micro` (<!-- fact:default:context.thresholds.micro -->0.7<!-- /fact -->) move large observations out behind an `artifact_read` pointer, `collapse` (<!-- fact:default:context.thresholds.collapse -->0.8<!-- /fact -->) and `reset` (<!-- fact:default:context.thresholds.reset -->0.88<!-- /fact -->) replace older history with a digest, and `trim` (<!-- fact:default:context.thresholds.trim -->0.95<!-- /fact -->) drops history outright. Pinned instruction blocks survive every stage, and so do the person's own requests.
+
+When `reset` fires, its digest is saved as the session's checkpoint, keeping the current turn verbatim, so later turns start from it instead of compacting the whole conversation again. `POST /v1/agents/:id/sessions/:key/compact` saves one on demand, keeping the last two turns by default. Every message stays stored.
 
 ## Completion
 

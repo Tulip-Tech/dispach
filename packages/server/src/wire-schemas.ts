@@ -710,6 +710,731 @@ export const SecretsBody = z.object({
     ),
 })
 
+// ─── responses ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * What the routes answer, as schemas — for the document, and for the harness that checks it.
+ *
+ * **Loose objects, on purpose.** `v: 1` promises that fields are only ever *added*, so a schema
+ * that refused an unknown key would turn every additive change into a failing client. What these
+ * pin is what a client may rely on: the fields named here, with their types and optionality, read
+ * off the handler and core's store types rather than guessed. `test/harness.ts` parses every JSON
+ * response a test provokes against its route's declared schema, so a field renamed in a handler
+ * and not here is a red suite rather than a reference that describes a server nobody runs.
+ */
+
+/** One `ErrorDetail` from core. */
+const ErrorDetailFields = {
+    code: z.string(),
+    message: z.string(),
+    hint: z.string(),
+    field: z.string().optional(),
+    detail: z.string().optional(),
+}
+
+/**
+ * The one failure envelope: `fail()` in `respond.ts`, and `ErrorDetail` in core.
+ *
+ * `details` is one level deep rather than recursive, which is what the runtime produces (a manifest
+ * that broke two rules) — and a recursive schema generates `$defs` references that resolve against
+ * the schema's own root, which breaks once the schema sits inside an OpenAPI document.
+ */
+const ErrorDetailSchema = z.looseObject({
+    ...ErrorDetailFields,
+    details: z.array(z.looseObject(ErrorDetailFields)).optional(),
+})
+export const ErrorBody = z.looseObject({ error: ErrorDetailSchema }).meta({
+    description:
+        "Every failure has this shape. `hint` is never absent: it is the part that says what to do.",
+})
+
+export const Health = z.looseObject({
+    status: z.literal("ok"),
+    version: z.string(),
+    uptimeMs: z.number(),
+    agents: z.number().int(),
+})
+
+/** `200` carries `ready`; `503` carries `starting` or `draining`, in the same shape. */
+export const Ready = z.looseObject({
+    status: z.enum(["ready", "starting", "draining"]),
+    agents: z.number().int(),
+})
+
+export const MessageAccepted = z.looseObject({
+    turnId: z.string(),
+    sessionKey: z.string(),
+    /** Only on the `200` an `Idempotency-Key` replay answers. */
+    replayed: z.literal(true).optional(),
+})
+
+export const TurnStopAccepted = z.looseObject({
+    turnId: z.string(),
+    stopping: z.literal(true),
+})
+
+/** `TurnRecord` in core's store. */
+export const TurnRecord = z.looseObject({
+    turnId: z.string(),
+    agentId: z.string(),
+    sessionKey: z.string(),
+    status: z.string(),
+    source: z.string(),
+    input: z.string(),
+    text: z.string(),
+    reasoning: z.string(),
+    steps: z.number().int(),
+    promptTokens: z.number(),
+    outputTokens: z.number(),
+    cachedPromptTokens: z.number().optional(),
+    cacheSource: z.string().optional(),
+    sender: z.string().optional(),
+    senderName: z.string().optional(),
+    senderKind: z.enum(SENDER_KINDS).optional(),
+    note: z.string().optional(),
+    errorCode: z.string().optional(),
+    errorMessage: z.string().optional(),
+    errorHint: z.string().optional(),
+    errorDetail: z.string().optional(),
+    startedAt: z.string(),
+    endedAt: z.string().optional(),
+    durationMs: z.number().optional(),
+})
+
+export const TurnPage = z.looseObject({
+    id: z.string(),
+    turns: z.array(TurnRecord),
+    nextBefore: z.number().int().optional(),
+})
+
+/** `SessionRecord` in core's store: what `GET …/sessions/:key` answers. */
+export const SessionRecord = z.looseObject({
+    agentId: z.string(),
+    sessionKey: z.string(),
+    channel: z.string(),
+    peerId: z.string(),
+    thread: z.string().optional(),
+    phase: z.string().optional(),
+    recall: z.literal(false).optional(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+})
+
+/** One row of `GET …/sessions`: the record, its counts, and whether it is the current head. */
+export const SessionSummary = SessionRecord.extend({
+    messages: z.number().int(),
+    turns: z.number().int(),
+    lastActivityAt: z.string(),
+    compactedAt: z.string().optional(),
+    head: z.boolean(),
+})
+
+export const SessionList = z.array(SessionSummary)
+
+const StoredMessage = z.looseObject({
+    id: z.number().int(),
+    sessionKey: z.string(),
+    turnId: z.string().optional(),
+    role: z.string(),
+    content: z.string(),
+    toolCalls: z.array(z.looseObject({})).optional(),
+    toolCallId: z.string().optional(),
+    origin: z.string().optional(),
+    tainted: z.boolean().optional(),
+    createdAt: z.string(),
+})
+
+export const MessagePage = z.looseObject({
+    messages: z.array(StoredMessage),
+    nextBefore: z.number().int().optional(),
+})
+
+/** `CompactedSession` in core's agent. */
+export const CompactResult = z.looseObject({
+    sessionKey: z.string(),
+    before: z.number(),
+    after: z.number(),
+    digest: z.enum(["model", "mechanical"]),
+    keptTurns: z.number().int(),
+})
+
+export const ResolveResult = z.looseObject({
+    requested: z.string(),
+    sessionKey: z.string(),
+})
+
+export const RotateResult = z.looseObject({
+    sessionKey: z.string(),
+    previous: z.string(),
+})
+
+/** `OperatorKeyRecord` in core's store. Never a secret, except once in `KeyMinted`. */
+const OperatorKey = z.looseObject({
+    keyId: z.string(),
+    label: z.string(),
+    createdAt: z.string(),
+    lastUsedAt: z.string().optional(),
+    revokedAt: z.string().optional(),
+    scope: z
+        .looseObject({
+            agents: z.array(z.string()).optional(),
+            sessions: z.string().optional(),
+            can: z.array(z.string()).optional(),
+            participant: z.string().optional(),
+        })
+        .optional(),
+    expiresAt: z.string().optional(),
+})
+
+export const KeyRecord = OperatorKey
+
+export const KeyMinted = OperatorKey.extend({
+    secret: z.string().meta({ description: "The credential. In this response and no other." }),
+})
+
+export const KeyList = z.looseObject({
+    keys: z.array(OperatorKey),
+    scope: z.string().meta({ description: "What a key's scope does and does not mean." }),
+})
+
+export const ProvisionResult = z.looseObject({
+    id: z.string(),
+    dir: z.string(),
+    files: z.array(z.string()),
+    adopted: z.array(z.string()),
+    /** Present when the agent was written and could not be started. */
+    error: ErrorDetailSchema.optional(),
+})
+
+export const ScheduleRunAccepted = z.looseObject({
+    scheduleId: z.string(),
+    turnId: z.string(),
+    sessionKey: z.string(),
+    outOfBand: z.literal(true),
+})
+
+// ── the rest of the surface: one schema per success body ────────────────────────────────
+
+const str = z.string()
+const strs = z.array(z.string())
+const int = z.number().int()
+/** A reload as a route reports it: `none`, done now, or held behind a running turn. */
+const ReloadState = z.enum(["none", "loaded", "pending"])
+
+/** `ScheduleRecord` in core. Its `undefined` columns are absent on the wire. */
+export const ScheduleRecord = z.looseObject({
+    agentId: str,
+    id: str,
+    kind: z.enum(["cron", "every", "at"]),
+    expr: str,
+    timezone: str.optional(),
+    task: str,
+    deliverChannel: str.optional(),
+    deliverTo: str.optional(),
+    sessionMode: str,
+    role: str.optional(),
+    toolsAllow: strs.optional(),
+    timeoutMs: z.number().optional(),
+    maxSteps: z.number().optional(),
+    enabled: z.boolean(),
+    origin: str,
+    anchorAt: str,
+    nextRunAt: str.optional(),
+    lastFiredAt: str.optional(),
+    lastStatus: str.optional(),
+    lastError: str.optional(),
+    lastRunId: str.optional(),
+    runs: int,
+})
+export const ScheduleList = z.looseObject({ schedules: z.array(ScheduleRecord) })
+export const SchedulePreview = z.looseObject({
+    kind: str,
+    zone: str,
+    next: strs,
+    jitterMs: z.number(),
+})
+export const ScheduleRemoved = z.looseObject({ removed: str })
+
+/** A channel as the agent resource reports it: the manifest's entry plus its live status. */
+const AgentChannel = z.looseObject({
+    id: str,
+    type: str,
+    enabled: z.boolean(),
+    status: str.optional(),
+    credentialEnv: str.optional(),
+    credentialSet: z.boolean().optional(),
+})
+
+/** `summary()` in the handler: what every hosted agent row carries. */
+const HostedAgent = z.looseObject({
+    id: str,
+    name: str,
+    description: str.optional(),
+    ask: z.boolean(),
+    status: z.literal("loaded"),
+    model: str,
+    channels: z.array(AgentChannel),
+    entryPhase: str.nullable(),
+    phases: strs.optional(),
+    sessionScope: str,
+})
+
+/** An agent switched off with `stop`: `stoppedRow()` in the handler. */
+const StoppedAgent = z.looseObject({
+    id: str,
+    name: str,
+    status: z.literal("disabled"),
+    reason: str.optional(),
+    disabledAt: str.optional(),
+})
+
+export const AgentList = z.array(
+    z.union([HostedAgent.extend({ assignee: str.nullable() }), StoppedAgent]),
+)
+
+export const AgentResource = z.union([
+    HostedAgent.extend({
+        dialect: str,
+        window: z.number(),
+        capabilities: z.looseObject({}),
+        tools: int,
+        catalogueTokens: z.number(),
+        skills: int,
+        schedules: int,
+    }),
+    StoppedAgent,
+    /** A manifest the host can find and is not running: `failed` carries why it would not load. */
+    z.looseObject({
+        id: str,
+        status: z.enum(["not_running", "failed"]),
+        error: ErrorDetailSchema.optional(),
+    }),
+])
+
+const Backlog = z.looseObject({})
+export const Activity = z.looseObject({
+    idle: z.boolean(),
+    turnsRunning: int,
+    deliveries: z.looseObject({ outbox: Backlog, webhooks: Backlog }),
+    nextWakeAt: str.optional(),
+})
+
+/** `AgentFootprint` in core: the rows `purgeAgent` deleted. */
+export const AgentRemoved = z.looseObject({
+    id: str,
+    removed: z.literal(true),
+    dir: str,
+    sessions: int,
+    messages: int,
+    turns: int,
+})
+
+/** `POST …/stop` and `…/start`: the switch's row, and on a start what was adopted. */
+export const AgentSwitched = z.looseObject({
+    id: str,
+    status: z.enum(["disabled", "loaded"]),
+    disabledAt: str.optional(),
+    reason: str.optional(),
+    adopted: strs.optional(),
+})
+
+export const AgentReloaded = z.looseObject({
+    id: str,
+    status: z.enum(["loaded", "pending"]),
+    adopted: strs,
+    running: z.number().optional(),
+    holdAfterMs: z.number().optional(),
+})
+
+/** `AgentBundle` in core. */
+export const Bundle = z.looseObject({
+    version: z.number(),
+    agentId: str,
+    exportedAt: str,
+    files: z.array(z.looseObject({ path: str, content: str })),
+})
+
+/** `ImportReport` in core, with the agent's id. */
+export const ImportResult = z.looseObject({
+    id: str,
+    added: strs,
+    merged: z.array(z.looseObject({ path: str, notes: int })),
+    skipped: strs,
+    overwritten: strs,
+    evicted: int,
+    reload: ReloadState,
+})
+
+export const VarsRecord = z.looseObject({
+    id: str,
+    template: str,
+    vars: z.record(str, str),
+})
+export const VarsApplied = z.looseObject({
+    id: str,
+    rendered: strs,
+    skipped: z.array(z.looseObject({ file: str, reason: str })),
+    reload: ReloadState,
+})
+
+export const WorkspaceList = z.looseObject({
+    id: str,
+    files: z.array(
+        z.looseObject({ name: str, tier: str, field: str, exists: z.boolean(), bytes: int }),
+    ),
+})
+export const WorkspaceFile = z.looseObject({
+    id: str,
+    file: str,
+    tier: str.optional(),
+    field: str.optional(),
+    exists: z.boolean(),
+    content: str,
+})
+
+/**
+ * A write to the agent's files, and whether it is in force: `applied`, or `pending` naming why
+ * not. Shared by the workspace, config and channel writers, which all answer this way.
+ */
+const AppliedFields = {
+    applied: z.boolean(),
+    pending: ErrorDetailSchema.optional(),
+}
+
+export const WorkspaceWritten = z.looseObject({
+    id: str,
+    file: str,
+    written: z.literal(true),
+    loads: z.boolean(),
+    error: ErrorDetailSchema.optional(),
+    ...AppliedFields,
+})
+
+/** `ToolsRefreshOutcome` in core, with the agent's id. */
+export const ToolsRefreshed = z.looseObject({
+    id: str,
+    providers: z.array(
+        z.looseObject({ provider: str, ok: z.boolean(), fetched: int, error: str.optional() }),
+    ),
+    added: strs,
+    removed: strs,
+    changed: strs,
+    reload: ReloadState,
+})
+
+/** `ProvisionStepWire` in the handler. */
+const ProvisionStep = z.looseObject({
+    step: str,
+    prompt: str,
+    fallback: str,
+    optional: z.boolean(),
+    secret: z.boolean(),
+    requires: z.looseObject({ step: str, value: str }).optional(),
+    choices: z.array(z.looseObject({ value: str, label: str, hint: str.optional() })).optional(),
+})
+export const ProvisionSteps = z.looseObject({
+    available: z.boolean(),
+    local: z.boolean(),
+    allowed: z.boolean(),
+    steps: z.array(ProvisionStep),
+})
+
+/** `TemplateWire` in the handler. */
+export const TemplateList = z.looseObject({
+    templates: z.array(
+        z.looseObject({
+            name: str,
+            description: str.optional(),
+            vars: z.array(
+                z.looseObject({
+                    name: str,
+                    description: str.optional(),
+                    required: z.boolean(),
+                    default: str.optional(),
+                    secret: z.boolean(),
+                }),
+            ),
+            problem: ErrorDetailSchema.optional(),
+        }),
+    ),
+})
+
+export const SecretStatus = z.looseObject({
+    id: str,
+    secrets: z.array(z.looseObject({ name: str, set: z.boolean(), usedBy: strs })),
+})
+export const SecretsWritten = z.looseObject({
+    written: strs,
+    shadowed: strs,
+    applied: z.enum(["none", "pending", "reloaded", "adopted"]),
+    adopted: strs,
+    stopped: z.boolean().optional(),
+    error: ErrorDetailSchema.optional(),
+})
+
+export const DeliveryAccepted = z.looseObject({
+    sessionKey: str,
+    key: str,
+    duplicate: z.boolean(),
+})
+
+/** `PendingApproval` in `approvals.ts`. */
+export const ApprovalList = z.looseObject({
+    approvals: z.array(
+        z.looseObject({
+            approvalId: str,
+            agentId: str,
+            sessionKey: str,
+            slug: str,
+            callId: str,
+            match: str.optional(),
+            mutating: z.boolean(),
+            reason: str,
+            requestedAt: str,
+        }),
+    ),
+})
+export const ApprovalDecided = z.looseObject({ approvalId: str, granted: z.boolean() })
+
+/** `WebhookSubscription` in core, plus `failing`. Never the secret, except once on create. */
+const Webhook = z.looseObject({
+    subscriptionId: str,
+    url: str,
+    types: strs,
+    scope: z.looseObject({ agents: strs.optional(), sessionPrefix: str.optional() }).optional(),
+    createdAt: str,
+    consecutiveFailures: int,
+    lastError: str.optional(),
+    lastSuccessAt: str.optional(),
+    lastFailureAt: str.optional(),
+    pending: int,
+    failing: z.boolean(),
+})
+export const WebhookCreated = Webhook.extend({
+    secret: str.meta({ description: "The signing secret. In this response and no other." }),
+})
+export const WebhookList = z.looseObject({ webhooks: z.array(Webhook) })
+
+/** `{id, deleted}`: every DELETE that reports whether a row went. */
+export const Deleted = z.looseObject({ id: str, deleted: z.boolean() })
+
+/** `ParticipantRecord` in core. */
+export const Participant = z.looseObject({
+    id: str,
+    kind: z.literal("human"),
+    name: str.optional(),
+    role: z.enum(["admin", "member"]),
+    title: str.optional(),
+    channelIds: strs.optional(),
+    timezone: str.optional(),
+    createdAt: str,
+    presence: z.enum(["online", "offline"]).optional(),
+    presenceAt: str.optional(),
+})
+export const ParticipantList = z.looseObject({ participants: z.array(Participant) })
+
+/** `ConversationRecord` in core. */
+export const Conversation = z.looseObject({
+    id: str,
+    kind: z.enum(["room", "dm"]),
+    title: str.optional(),
+    members: strs,
+    createdAt: str,
+})
+export const ConversationList = z.looseObject({ conversations: z.array(Conversation) })
+
+/** `ConversationMessageRecord` in core. */
+export const ConversationMessage = z.looseObject({
+    id: str,
+    conversationId: str,
+    authorId: str,
+    origin: z.enum(["human", "agent"]),
+    text: str,
+    mentions: strs,
+    hop: int,
+    turnId: str.optional(),
+    onBehalfOf: str.optional(),
+    seq: int,
+    createdAt: str,
+})
+export const ConversationLog = z.looseObject({
+    conversationId: str,
+    messages: z.array(ConversationMessage),
+    nextAfter: int.optional(),
+})
+
+/** `DeferredActionRecord` in core. */
+export const DeferredAction = z.looseObject({
+    id: str,
+    agentId: str,
+    conversationId: str,
+    ownerId: str,
+    requestedBy: str,
+    slug: str,
+    args: z.record(str, z.unknown()),
+    status: z.enum(["pending", "done", "failed", "denied"]),
+    result: str.optional(),
+    createdAt: str,
+    decidedAt: str.optional(),
+})
+export const ActionList = z.looseObject({ actions: z.array(DeferredAction) })
+
+/** `AssignmentRecord` in core. */
+export const Assignment = z.looseObject({
+    agentId: str,
+    participantId: str,
+    channelIds: strs.optional(),
+    assignedBy: str.optional(),
+    assignedAt: str,
+})
+export const AssigneeRead = z.looseObject({ id: str, assignment: Assignment.nullable() })
+export const AssigneeCleared = z.looseObject({ id: str, unassigned: z.boolean() })
+
+/** `MemoryNoteRecord` in core. */
+export const MemoryNote = z.looseObject({
+    id: str,
+    scope: str,
+    text: str,
+    writtenBy: str,
+    createdAt: str,
+})
+export const NoteList = z.looseObject({ notes: z.array(MemoryNote) })
+
+/** `MemoryReadRecord` in core. */
+export const MemoryReads = z.looseObject({
+    reads: z.array(
+        z.looseObject({
+            scope: str,
+            reader: str,
+            turnId: str,
+            sessionKey: str,
+            requestedBy: str.optional(),
+            onBehalfOf: str.optional(),
+            sources: strs,
+            at: str,
+        }),
+    ),
+})
+
+/** `ProjectRecord` in core. */
+export const Project = z.looseObject({
+    id: str,
+    name: str.optional(),
+    agents: strs,
+    createdAt: str,
+})
+export const ProjectList = z.looseObject({ projects: z.array(Project) })
+export const SpaceWriter = z.looseObject({ writer: str })
+
+/** `UsageBucket` in core. */
+export const Usage = z.looseObject({
+    buckets: z.array(
+        z.looseObject({
+            agentId: str.optional(),
+            model: str.optional(),
+            day: str.optional(),
+            sender: str.optional(),
+            calls: int,
+            promptTokens: z.number(),
+            cachedPromptTokens: z.number(),
+            cacheWriteTokens: z.number(),
+            outputTokens: z.number(),
+            images: z.number(),
+            audioSeconds: z.number(),
+            estimatedCalls: int,
+        }),
+    ),
+    meteredSince: str.optional(),
+})
+export const AgentUsage = Usage.extend({ id: str })
+
+export const SessionCleared = z.looseObject({ cleared: str, memoryFilesKept: z.literal(true) })
+export const PhaseSet = z.looseObject({ sessionKey: str, phase: str.nullable() })
+export const RecallSet = z.looseObject({ sessionKey: str, recall: z.boolean() })
+
+export const ConfigListing = z.looseObject({
+    running: z.boolean(),
+    editable: z.boolean(),
+    file: str.optional(),
+    settings: z.array(
+        z.looseObject({
+            path: str,
+            means: str,
+            confirm: str.optional(),
+            value: z.unknown().optional(),
+        }),
+    ),
+})
+
+/** One edit as `PATCH …/config` reports it. A single change is spread; several are `changes`. */
+const ConfigEdit = z.looseObject({
+    path: str,
+    before: z.unknown().optional(),
+    after: z.unknown().optional(),
+    reflowed: z.boolean(),
+    changed: z.boolean(),
+})
+export const ConfigApplied = z.looseObject({
+    path: str.optional(),
+    changes: z.array(ConfigEdit).optional(),
+    reloaded: z.boolean(),
+    ...AppliedFields,
+})
+
+export const ChannelPatched = z.looseObject({ channelId: str, notes: strs, ...AppliedFields })
+export const ChannelUnpaired = z.looseObject({ channelId: str, note: str, restarted: z.boolean() })
+
+export const ToolList = z.array(
+    z.looseObject({
+        slug: str,
+        summary: str,
+        mutating: z.boolean(),
+        trust: str,
+        trustReason: str.optional(),
+        provider: str,
+        tags: strs,
+        phases: strs.optional(),
+    }),
+)
+
+export const SkillList = z.looseObject({
+    configured: z.boolean(),
+    maxActive: z.number().optional(),
+    threshold: z.number().optional(),
+    cached: z.boolean().optional(),
+    skills: z.array(
+        z.looseObject({
+            name: str,
+            description: str,
+            tokens: z.number(),
+            whenNotToUse: str.optional(),
+            scripts: strs,
+            trusted: z.boolean(),
+        }),
+    ),
+})
+
+/** `Agent.previewContext` in core. */
+export const ContextPreview = z.looseObject({
+    slots: z.array(
+        z.looseObject({ slot: int, label: str, tokens: z.number(), pinned: z.boolean() }),
+    ),
+    history: z.array(z.looseObject({ label: str, tokens: z.number(), messages: int })),
+    total: z.number(),
+    window: z.number(),
+    wireTokens: z.number(),
+    reserveOutput: z.number(),
+    calibration: z.looseObject({}),
+    compactions: int,
+})
+
+/** The document itself, by its top-level shape. */
+export const OpenApiDocument = z.looseObject({
+    openapi: str,
+    info: z.looseObject({ title: str, version: str }),
+    paths: z.record(str, z.looseObject({})),
+})
+
 // ─── the one validator ──────────────────────────────────────────────────────────────────
 
 /**

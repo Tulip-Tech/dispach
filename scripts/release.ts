@@ -129,9 +129,12 @@ writeFileSync(VERSION_TS, versionTs.replace(`VERSION = "${pkg.version}"`, `VERSI
 // The lockfile records workspace versions.
 run("bun", ["install"])
 
+// Every copy of the version in the README and the docs comes from the package just written.
+run("bun", ["scripts/facts.ts"])
+
 process.stdout.write(`\n  ${pkg.version} → ${version}\n`)
 process.stdout.write(
-    "    packages/cli/package.json\n    packages/core/src/version.ts\n    CHANGELOG.md\n    bun.lock\n    developer-docs/reference/openapi.json\n",
+    "    packages/cli/package.json\n    packages/core/src/version.ts\n    CHANGELOG.md\n    bun.lock\n    developer-docs/reference/openapi.json\n    every fact copy (scripts/facts.ts)\n",
 )
 
 if (!argv.includes("--no-gate")) {

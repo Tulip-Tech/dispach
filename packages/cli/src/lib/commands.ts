@@ -202,7 +202,7 @@ export const COMMANDS: readonly CommandSpec[] = [
                 kind: "string",
                 placeholder: "level",
                 help: "keep it running in the background: none | service",
-                defaultHelp: "none",
+                defaultHelp: "service",
             },
             {
                 name: "dir",

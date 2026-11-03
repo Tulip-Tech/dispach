@@ -8,7 +8,13 @@ import cliPackage from "../../packages/cli/package.json"
  * The landing page's numbers, read from the committed results at build time so the page cannot
  * say something `evals/` does not. Each figure has a row in `evals/CLAIMS.md`.
  */
-const boot = bootResult as { processMs: { median: number }; machine: { cpu: string } }
+const boot = bootResult as {
+    processMs: { median: number }
+    machine: { cpu: string }
+    runs: number
+    ciFailMs: number
+    runtime: string
+}
 const tenancy = tenancyResult as {
     results: Record<string, { median: { idleRssKb: number } }>
 }
@@ -70,6 +76,10 @@ export const benchmark = {
 export const evidence = {
     bootMs: Math.round(boot.processMs.median),
     bootMachine: boot.machine.cpu,
+    bootRuns: boot.runs,
+    bootCiFailMs: boot.ciFailMs,
+    /** The runtime the boot was measured under, e.g. "bun 1.3.5": not what ships, so say so. */
+    bootRuntime: boot.runtime,
     agents: 100,
     idleMiB: Math.round((tenancy.results["100"]?.median.idleRssKb ?? 0) / 1024),
     dialect: tools.results.map((r) => ({
@@ -78,4 +88,8 @@ export const evidence = {
         native: Math.round(r.native.summary.accuracy * 1000) / 10,
     })),
     version: cliPackage.version,
+    /** The release line a reader can rely on, `0.2.x`, from the same version. */
+    line: `${cliPackage.version.split(".").slice(0, 2).join(".")}.x`,
+    /** The Node floor `npm` enforces, from `engines.node`. */
+    node: cliPackage.engines.node.replace(/^>=\s*/, ""),
 }

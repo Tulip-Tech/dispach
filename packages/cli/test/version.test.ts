@@ -8,10 +8,10 @@
  * those two facts."* That was true while all nine workspace packages published together. It stopped
  * being true the moment the release became one package.
  *
- * `.changeset/config.json` carries `ignore: ["@dispach/*"]`, so `changeset version` bumps
- * `packages/cli` — the manifest of the published `dispach` — and leaves every sibling at `0.1.0`
- * deliberately. Under the old guard that produced a perfectly green suite for a released binary
- * printing the wrong number:
+ * Only `packages/cli` — the manifest of the published `dispach` — is bumped, and every sibling
+ * stays at `0.1.0` deliberately (Changesets' `ignore: ["@dispach/*"]` until 0.1.3,
+ * `scripts/release.ts` since). Under the old guard that produced a perfectly green suite for a
+ * released binary printing the wrong number:
  *
  *     packages/cli/package.json   0.1.1   ← published as dispach@0.1.1
  *     packages/core/package.json  0.1.0   ← ignored, never bumped again
@@ -35,8 +35,8 @@ import { readFileSync } from "node:fs"
 import { VERSION } from "@dispach/core"
 
 test("VERSION matches the published package's version", () => {
-    // `changeset version` rewrites this manifest and knows nothing about the constant, which is
-    // what makes them two facts that have to be tied together by something.
+    // `bun run release` writes both, but anything else that bumps this manifest knows nothing
+    // about the constant, which is what makes them two facts that have to be tied together.
     const manifest: unknown = JSON.parse(
         readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     )

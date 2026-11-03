@@ -13,7 +13,7 @@
         },
         {
             "section": "Harness head-to-head",
-            "claim": "Matches or beats Hermes 0.19.0 on 8 of 11 models, and costs the least of the three harnesses on 10 of 11 (level with Hermes on GPT-6.1 Sol)",
+            "claim": "Matches or beats Hermes 0.19.0 on 8 of 11 models, and costs the least of the three harnesses on 10 of 11 (on GPT-6.1 Sol Hermes is cheaper, $0.5262 against $0.5439)",
             "evidence": "`evals/harness/summary.json`",
             "scope": "Same tasks, isolation and pinned providers for all three harnesses",
             "limitation": "Rival arms measured 2026-10-22/23, Dispach on 2026-10-23; the 95% intervals of every Dispach–Hermes pair overlap, gpt-oss-20b only just (70–84% against 82–93%)",
@@ -303,7 +303,7 @@
             "section": "Prompting, context and memory",
             "claim": "Memory retrieval: median 0.34 ms, slowest 3.7 ms over 5,000 passages",
             "evidence": "`evals/memory/results.json`",
-            "scope": "No model; FTS5 candidates scored in `rank/bm25.ts`",
+            "scope": "No model; FTS5 candidates scored in `packages/core/src/rank/bm25.ts`",
             "limitation": "One machine",
             "status": "verified",
             "files": [
@@ -326,7 +326,7 @@
             "claim": "Prompt injection via a fetched page: 0 of 6 cases executed",
             "evidence": "`evals/web/results.json`, `evals/web/native/results.json`, `evals/web/flash/results.json` (2026-08-15)",
             "scope": "deepseek-v4-pro (NLT and native), deepseek-v4-flash",
-            "limitation": "Measures the **model**: the write gate never fired. The gate is proven by `trust.test.ts`, not by this eval. No small model was run",
+            "limitation": "Measures the **model**: the write gate never fired. The gate is proven by `packages/core/test/trust.test.ts`, not by this eval. No small model was run",
             "status": "verified",
             "files": [
                 "evals/web/results.json",
@@ -348,13 +348,11 @@
         {
             "section": "Safety and agents",
             "claim": "Delegation cuts the parent's prompt by 31.6%",
-            "evidence": "Fixture-only run, no `results.json`",
+            "evidence": "Fixture-only run, no results file",
             "scope": "—",
             "limitation": "Never run against a real endpoint; total tokens went **up**",
             "status": "needs-run",
-            "files": [
-                "results.json"
-            ]
+            "files": []
         },
         {
             "section": "Safety and agents",
