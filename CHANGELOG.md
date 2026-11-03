@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+_Nothing yet._
+
+## 0.2.4 — 2026-11-03
+
 ### Documentation
 
 - An npm quickstart (install, `init`, `serve`, `curl /v1/ready`) is where the site's "Run it in five minutes" leads; the Docker page leads with a plain `docker run` of the published image.

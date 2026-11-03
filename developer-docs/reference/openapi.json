@@ -2,7 +2,7 @@
     "openapi": "3.1.0",
     "info": {
         "title": "Dispach agent server",
-        "version": "0.2.3",
+        "version": "0.2.4",
         "description": "Generated from the router table and the request and response schemas — see openapi.ts. Every declared response body is checked against the handler by the server's test harness. The binding contract is docs/04-SPEC-WIRE.md, which is checked against the code."
     },
     "servers": [

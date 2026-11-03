@@ -6,7 +6,7 @@
 # Puts the release in ~/.dispach/versions/<version>, links ~/.dispach/bin/dispach at it, and adds
 # ~/.dispach/bin to PATH in your shell's rc file (it says which). Nothing needs root.
 #
-#   DISPACH_VERSION=0.2.3        a specific release instead of the latest
+#   DISPACH_VERSION=0.2.4        a specific release instead of the latest
 #   DISPACH_NO_MODIFY_PATH=1     leave every rc file alone
 #   DISPACH_INSTALL_DIR=<dir>    install somewhere other than ~/.dispach
 #   DISPACH_DOWNLOAD_BASE=<url>  fetch the archive and SHA256SUMS from a mirror (or a test build)

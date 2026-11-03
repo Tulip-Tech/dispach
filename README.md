@@ -27,7 +27,7 @@ agent and streams its reply in three requests.
 
 ```bash
 docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach \
-  -e DISPACH_API_TOKEN=pick-a-secret ghcr.io/moeen-mahmud/dispach:0.2.3
+  -e DISPACH_API_TOKEN=pick-a-secret ghcr.io/moeen-mahmud/dispach:0.2.4
 ```
 
 The named volume is where the store, every agent and every key live; without it a `docker rm` for
@@ -52,7 +52,7 @@ they work for, and stand in for them, openly, when they are away. That half ship
 Everything else described in this README is stable.
 
 **Docs:** [dispach.blivius.com/docs](https://dispach.blivius.com/docs) ·
-**New in <!-- fact:version -->0.2.3<!-- /fact -->:** [the changelog, with upgrade notes](CHANGELOG.md) ·
+**New in <!-- fact:version -->0.2.4<!-- /fact -->:** [the changelog, with upgrade notes](CHANGELOG.md) ·
 **New since 0.2.0:** [what each release added](developer-docs/runtime/whats-new-since-0-2-0.md) ·
 **Limits:** [what is measured, and what it does not do](developer-docs/runtime/limits-and-evidence.md)
 
@@ -71,7 +71,7 @@ or the [larger pieces that need an owner](https://github.com/moeen-mahmud/dispac
 ```bash
 export TOKEN=pick-a-secret
 docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach -e DISPACH_API_TOKEN=$TOKEN \
-  ghcr.io/moeen-mahmud/dispach:0.2.3
+  ghcr.io/moeen-mahmud/dispach:0.2.4
 
 curl -s -H "Authorization: Bearer $TOKEN" localhost:7420/v1/agents \
   -d '{"answers":{"user":"you","name":"milo","apiKey":"sk-…"}}'
@@ -124,7 +124,7 @@ gap of a few runs is noise. Hermes leads on Gemini 4 Argon and the two small ope
 
 ## Status
 
-**<!-- fact:version -->0.2.3<!-- /fact -->**, from npm, Homebrew, the container image or the standalone installer. Every install
+**<!-- fact:version -->0.2.4<!-- /fact -->**, from npm, Homebrew, the container image or the standalone installer. Every install
 runs under Node. [`CHANGELOG.md`](CHANGELOG.md) has what landed in each release.
 
 Built and in use:
@@ -203,7 +203,7 @@ Full rationale for every decision, including the negative ones, is in `docs/00-D
 
 ```bash
 npm i -g dispach          # the `dispach` command
-dispach --version         # 0.2.3
+dispach --version         # 0.2.4
 ```
 
 and in an application that talks to a running server:
@@ -238,7 +238,7 @@ Nothing needs root. Run it again to upgrade.
 
 | Variable | Effect |
 | --- | --- |
-| `DISPACH_VERSION=0.2.3` | that release instead of the latest |
+| `DISPACH_VERSION=0.2.4` | that release instead of the latest |
 | `DISPACH_NO_MODIFY_PATH=1` | change no rc file; it prints the line to add |
 | `DISPACH_INSTALL_DIR=<dir>` | install somewhere other than `~/.dispach` |
 
@@ -272,7 +272,7 @@ same agents.
 ### Or the container
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.2.3
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.4
 ```
 
 The [Docker](#docker) and [Compose](#hosting-with-compose) sections below have the run lines and
@@ -291,7 +291,7 @@ bun run build                       # builds every package the binary imports
 cd packages/cli && bun link         # puts `dispach` on your PATH
 cd ../..
 
-dispach --version                   # 0.2.3
+dispach --version                   # 0.2.4
 dispach --help
 ```
 
@@ -654,14 +654,14 @@ consequence: run it on a laptop and the policy is the only boundary there is.
 ## Docker
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.2.3          # or build it: docker build -f docker/Dockerfile -t dispach .
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.4          # or build it: docker build -f docker/Dockerfile -t dispach .
 cp examples/minimal/.env.example examples/minimal/.env  # then MODEL_API_KEY; only the example is tracked
 docker run --rm --init -p 7420:7420 \
   --env-file examples/minimal/.env \
   -e DISPACH_API_TOKEN=pick-something \
   -v "$PWD/examples/minimal:/agent" \
   -v dispach-home:/home/dispach \
-  ghcr.io/moeen-mahmud/dispach:0.2.3
+  ghcr.io/moeen-mahmud/dispach:0.2.4
 ```
 
 The token is not optional and is not boilerplate. The image binds `0.0.0.0`, because a process
