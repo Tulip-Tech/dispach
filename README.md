@@ -51,7 +51,7 @@ Everything else described in this README is stable.
 
 **Docs:** [dispach.blivius.com/docs](https://dispach.blivius.com/docs) ·
 **New in <!-- fact:version -->0.2.3<!-- /fact -->:** [the changelog, with upgrade notes](CHANGELOG.md) ·
-**New since 0.2.0:** [what each release added](developer-docs/runtime/whats-new-0-2.md) ·
+**New since 0.2.0:** [what each release added](developer-docs/runtime/whats-new-since-0-2-0.md) ·
 **Limits:** [what is measured, and what it does not do](developer-docs/runtime/limits-and-evidence.md)
 
 **Contributing:** start with a [good first issue](https://github.com/moeen-mahmud/dispach/labels/good%20first%20issue)

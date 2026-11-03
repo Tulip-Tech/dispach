@@ -17,7 +17,7 @@ Choose the path that matches what you are building:
   multi-tenant integration.
 - Read [security and trust](concepts/security-and-trust.md) before enabling system or web tools.
 
-This site documents the current 0.2.x release; [what's new since 0.2.0](whats-new-0-2.md) lists what each
+This site documents the current 0.2.x release; [what's new since 0.2.0](whats-new-since-0-2-0.md) lists what each
 release added. Experimental surfaces say so where they are described; the [release guide](releases.md)
 explains the release lines. A server reports its exact version at `GET /v1/health`, and every endpoint
 is in the [API reference](../reference/README.md).
