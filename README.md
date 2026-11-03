@@ -9,11 +9,13 @@
 with memory, tools, schedules, channels and approvals, on any OpenAI-compatible model.
 
 ```bash
-npm i -g dispach      # Node 24+, or: brew install moeen-mahmud/tap/dispach
-# no Node? curl -fsSL https://github.com/moeen-mahmud/dispach/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/moeen-mahmud/dispach/releases/latest/download/install.sh | sh
+#   or: npm i -g dispach (Node 24+) · brew install moeen-mahmud/tap/dispach
 dispach init          # name the agent, pick a model, paste a key
 dispach run milo      # talk to it in the terminal
 ```
+
+![A fresh Linux machine with no Node: the curl installer, init, serve, /v1/ready, then a first message in the terminal UI](https://raw.githubusercontent.com/moeen-mahmud/dispach/HEAD/.github/assets/install.gif)
 
 ![The terminal UI: told to give itself write access to the whole home directory, the agent tries, and the settings floor refuses](https://raw.githubusercontent.com/moeen-mahmud/dispach/HEAD/.github/assets/tui.gif)
 

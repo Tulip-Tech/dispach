@@ -208,6 +208,11 @@ export default function HomePage() {
                         {brand.slug}
                         <span className="ml-2">· Node {evidence.node}+</span>
                     </p>
+                    <p className="mt-1 break-all font-mono text-xs text-fd-muted-foreground">
+                        <span className="text-term-accent">›</span> curl -fsSL {repoUrl}
+                        /releases/latest/download/install.sh | sh
+                        <span className="ml-2">· no Node needed</span>
+                    </p>
                 </div>
                 <Replay
                     lines={replay}

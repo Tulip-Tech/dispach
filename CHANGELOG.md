@@ -8,6 +8,7 @@
 - The HTTP reference declares the response body of every operation and the error shape of every error status, with corrected statuses (`turns/:turnId/stop`, `schedules/:sid/run` and `deliveries` answer 202, `POST /v1/memory/notes` 201), the `Idempotency-Key` header, the SSE media types, open routes without a credential, and `GET /v1/ws`. The server's test harness checks every response the suite provokes against the declared schema.
 - The API reference is in the site's top navigation and first in the runtime sidebar's reference group, with operations grouped by resource.
 - Every version, the Node floor, the image, manifest defaults, the endpoint count and the console's page list come from one source (`scripts/facts.ts`); `bun run release` rewrites each copy and `docs:check` fails on a stale one. `docs:check` also fails on a link that is no page on the site, a `/docs/…` link in the site's code that names no page, and an operation with no response body.
+- The `curl … install.sh | sh` one-liner leads the README's install block, has its own step on the install quickstart, and sits under the landing page's npm line. A new README GIF (`.github/assets/install.tape`) records that path on a fresh Linux machine with no Node: install, `init`, `serve`, `/v1/ready`, then a first message in the TUI.
 - "What's new since 0.2.0" covers 0.2.1–0.2.3; fifteen guide and reference pages corrected against the code (checkpoints save at `reset`, handoffs inherit taint, `reload_pending` applies itself, the events catalogue, configuration defaults, sessions scope).
 
 ### Fixed
