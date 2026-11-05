@@ -24,7 +24,7 @@ import {
     processAlive,
 } from "../src/runtime/lease.ts"
 import { Runtime } from "../src/runtime/runtime.ts"
-import { openMemoryStore } from "../src/store/sqlite/store.ts"
+import { openMemoryStore, SqliteStore } from "../src/store/sqlite/store.ts"
 import { describe, expect, test } from "./_harness.ts"
 
 const NOW = Date.parse("2026-08-17T02:00:00.000Z")
@@ -114,6 +114,85 @@ describe("claiming a lease", () => {
         // The holder is untouched — a declined claim must not quietly rewrite the row.
         expect((await store.leases.get("a"))?.runtimeId).toBe("rt_1")
         await store.close()
+    })
+
+    /**
+     * `docker run --init`: the old container ran the runtime as pid 1 and was removed, leaving a
+     * lease saying pid 1 with a fresh heartbeat; the new one runs `docker-init` as pid 1 and the
+     * runtime as pid 7. Pid 1 is alive and is not ours, so without the executable check this
+     * refused for forty-five minutes. A pid 1 that *is* node is still a live holder.
+     */
+    test("a lease naming pid 1 is dead when pid 1 is an init, and live when it is node", async () => {
+        const store = await openMemoryStore()
+        await claimLeases({
+            store,
+            agentIds: ["a"],
+            runtimeId: "rt_old",
+            mode: "terminal",
+            now: NOW,
+            pid: 1,
+            exclusive: true,
+            isAlive: alive,
+        })
+
+        const underInit = await claimLeases({
+            store,
+            agentIds: ["a"],
+            runtimeId: "rt_new",
+            mode: "terminal",
+            now: NOW + 5_000,
+            pid: 7,
+            exclusive: true,
+            isAlive: alive,
+            executableOf: () => "docker-init",
+        })
+        expect(underInit.owned).toEqual(["a"])
+        expect(underInit.tookOver.map((lease) => lease.runtimeId)).toEqual(["rt_old"])
+
+        await expect(
+            claimLeases({
+                store,
+                agentIds: ["a"],
+                runtimeId: "rt_third",
+                mode: "terminal",
+                now: NOW + 6_000,
+                pid: 8,
+                exclusive: true,
+                isAlive: alive,
+                executableOf: () => "node",
+            }),
+        ).rejects.toThrow("already being served by pid 7")
+        await store.close()
+    })
+
+    test("a pid 1 that is node is a live holder; an unreadable one falls through", async () => {
+        for (const executableOf of [() => "node", () => undefined]) {
+            const store = await openMemoryStore()
+            await claimLeases({
+                store,
+                agentIds: ["a"],
+                runtimeId: "rt_old",
+                mode: "terminal",
+                now: NOW,
+                pid: 1,
+                exclusive: true,
+                isAlive: alive,
+            })
+            await expect(
+                claimLeases({
+                    store,
+                    agentIds: ["a"],
+                    runtimeId: "rt_new",
+                    mode: "terminal",
+                    now: NOW + 5_000,
+                    pid: 7,
+                    exclusive: true,
+                    isAlive: alive,
+                    executableOf,
+                }),
+            ).rejects.toThrow("already being served by pid 1")
+            await store.close()
+        }
     })
 
     test("a stale heartbeat with a dead pid is taken over", async () => {
@@ -871,6 +950,30 @@ channels:
             const transport = runtime.channels.statusOf("test").find((s) => s.id === "sc")
             expect(transport).toBeDefined()
             await runtime.stop()
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+
+    test("a store snapshot carries no leases, so a restore is not refused by the process it was taken from (pilot.12)", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "lease-snapshot-"))
+        try {
+            const store = await openMemoryStore()
+            await store.leases.claim({
+                agentId: "a",
+                runtimeId: "rt_old",
+                pid: 7,
+                mode: "daemon",
+                now: new Date().toISOString(),
+            })
+            const path = join(dir, "copy.db")
+            await store.snapshot(path)
+            // The live store keeps its own.
+            expect((await store.leases.get("a"))?.pid).toBe(7)
+            await store.close()
+            const copy = await SqliteStore.open({ path })
+            expect(await copy.leases.all()).toEqual([])
+            await copy.close()
         } finally {
             rmSync(dir, { recursive: true, force: true })
         }

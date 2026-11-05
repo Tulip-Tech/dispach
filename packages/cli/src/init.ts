@@ -16,7 +16,7 @@
  */
 
 import { basename, dirname, join, resolve } from "node:path"
-import { BRAND, HarnessError, VERSION } from "@dispach/core"
+import { BRAND, HarnessError, isHarnessError, SqliteStore, VERSION } from "@dispach/core"
 import { installRefs } from "#browse"
 import { announce } from "#lib/bootstrap"
 import { EXIT_FAILURE, EXIT_OK } from "#lib/const"
@@ -38,9 +38,11 @@ import {
 import { findAndInstallSkill } from "#lib/init-skills"
 import { type PairOutcome, pairLater, pairWhatsApp } from "#lib/init-whatsapp"
 import { negotiateKeyboard } from "#lib/keyboard"
+import { measuredWindow } from "#lib/measure-window"
 import { resolveModeFromProcess } from "#lib/output"
+import { claimManifest } from "#lib/owner"
 import { checkAgentLoads, complete, FLAG_FOR, fillDefaults, writeAgentFiles } from "#lib/provision"
-import { agentsDir, outsideSandboxNote } from "#lib/sandbox"
+import { agentsDir, insideSandbox, outsideSandboxNote, storePath } from "#lib/sandbox"
 import type { InitOptions } from "#lib/schema"
 import { webUrl } from "#lib/web-url"
 
@@ -106,7 +108,23 @@ async function runInit(options: InitOptions): Promise<InitResult> {
         )
     }
 
-    const answers = complete(partial, defaults)
+    // Asked once, here, and never at boot: the endpoint's own window beats the registry's guess by
+    // model id (decision 14.124). Unknown is fine; the registry stays in charge.
+    const completed = complete(partial, defaults)
+    const keyForProbe =
+        completed.apiKey ??
+        (completed.apiKeyEnv === undefined ? undefined : process.env[completed.apiKeyEnv])
+    // Only when someone is at the keyboard or asked for it: `init --yes` and a pipe reach no network.
+    // Not probed for Bedrock: the probe speaks chat-completions, and there is no URL to ask.
+    const window =
+        (interactive || options.measureWindow === true) && completed.baseUrl !== ""
+            ? await measuredWindow(completed.baseUrl, completed.model, {
+                  ...(keyForProbe === undefined || keyForProbe === ""
+                      ? {}
+                      : { apiKey: keyForProbe }),
+              })
+            : undefined
+    const answers = completed
     const targetDir = resolve(process.cwd(), answers.dir)
 
     // Said before anything is written, not after: the cost of an out-of-sandbox agent is paid by
@@ -116,7 +134,7 @@ async function runInit(options: InitOptions): Promise<InitResult> {
     const note = outsideSandboxNote(targetDir)
     if (note !== undefined) process.stderr.write(`${note}\n`)
     const manifestPath = join(targetDir, "agent.yaml")
-    const files = planFiles(answers)
+    const files = planFiles(answers, window)
 
     // Per-target checks rather than "directory not empty": a fresh `git init`'d directory must
     // work, and the refusal names every collision at once rather than one per run.
@@ -147,7 +165,7 @@ async function runInit(options: InitOptions): Promise<InitResult> {
         // The files stay on disk — they are inspectable evidence — but the exit is a failure and
         // the loader's own report is printed verbatim. A generated agent that cannot load is this
         // command's bug, and hiding it behind exit 0 would be rule 8's exact shape.
-        if (error instanceof HarnessError) {
+        if (isHarnessError(error)) {
             process.stderr.write(
                 `init wrote ${files.length} files to ${targetDir}, but the result does not load:\n${error.format()}\n`,
             )
@@ -196,6 +214,8 @@ async function runInit(options: InitOptions): Promise<InitResult> {
             })
         }
     }
+
+    await claimForOwner(manifestPath, targetDir, defaults.agentDirBase)
 
     /**
      * The host first, then the channel — because the host is what pairs it.
@@ -254,6 +274,41 @@ async function runInit(options: InitOptions): Promise<InitResult> {
 }
 
 /**
+ * Make the person running `init` this agent's owner (decision 15.7), before any host adopts it, so it
+ * boots owned: the manifest just written says `sessions.scope: owner`, and an owner scope with nobody
+ * assigned is one conversation per surface plus a warning.
+ *
+ * Only inside the sandbox, whose store is the one the sandbox's agents run on and whose path a test
+ * redirects. An agent written elsewhere is told the command that does it, and never fails the init:
+ * every agent on disk is a complete agent, owned or not.
+ */
+async function claimForOwner(
+    manifestPath: string,
+    targetDir: string,
+    agentsBase: string,
+): Promise<void> {
+    const id = basename(targetDir)
+    if (!insideSandbox(targetDir)) {
+        process.stdout.write(
+            `\nTo make it yours across every surface: ${BRAND.slug} owner adopt ${manifestPath}\n`,
+        )
+        return
+    }
+    let store: SqliteStore | undefined
+    try {
+        store = await SqliteStore.open({ path: storePath() })
+        await claimManifest(store, manifestPath, agentsBase)
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        process.stderr.write(
+            `could not record you as ${id}'s owner: ${detail}\n  hint: run \`${BRAND.slug} owner adopt ${id}\` once the store is reachable.\n`,
+        )
+    } finally {
+        await store?.close()
+    }
+}
+
+/**
  * `--skills` as a choice, or as a search phrase.
  *
  * `--skills starter` and `--skills none` are the choices; `--skills "pdf tables"` means "find one", with
@@ -280,6 +335,7 @@ function fromFlags(options: InitOptions): Partial<Record<InitStep, string>> {
         ["preset", options.preset],
         ["model", options.model],
         ["baseUrl", options.baseUrl],
+        ["region", options.region],
         ["apiKeyEnv", options.apiKeyEnv],
         ["system", options.system],
         ["web", options.web],
@@ -451,7 +507,7 @@ function nextSteps(
         answers.skills === "find"
             ? `Add more skills: \`${BRAND.slug} sources search <what it should do>\` ranks every skill in the catalogues, then \`${BRAND.slug} skills install ${runRef} <source>/<skill>\`.`
             : answers.skills === "starter"
-              ? `Fill in workspace-level skills/starter/SKILL.md, or take a real one — \`${BRAND.slug} sources search <what it should do>\` searches 440+ from two catalogues.`
+              ? `Fill in workspace-level skills/starter/SKILL.md, or take a real one — \`${BRAND.slug} sources search <what it should do>\` searches the configured catalogues.`
               : `Skills are off but the directory is there — \`${BRAND.slug} sources search <what it should do>\` finds one, \`${BRAND.slug} skills new ${runRef} <name>\` writes one.`,
     )
     steps.push(

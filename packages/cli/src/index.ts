@@ -20,7 +20,7 @@
  * without a command, reporting failure for the one thing that had worked.
  */
 
-import { HarnessError, VERSION } from "@dispach/core"
+import { BRAND, HarnessError, isHarnessError, VERSION } from "@dispach/core"
 import { agentsCommand } from "#agents"
 import { browseCommand } from "#browse"
 import { daemonCommand } from "#daemon"
@@ -35,10 +35,13 @@ import { readEnv } from "#lib/env"
 import { finishNow, installGuards } from "#lib/exit"
 import { helpText } from "#lib/help"
 import { installServerUnit } from "#lib/host-actions"
+import { missingInterface } from "#lib/interface-missing"
 import { resolveAgentRef } from "#lib/sandbox"
+import { loadSecretFiles } from "#lib/secret-files"
 import { quietAcceptedWarnings } from "#lib/warnings"
 import { memoryCommand } from "#memory"
 import { modelCommand } from "#model"
+import { ownerCommand } from "#owner"
 import { pluginsCommand } from "#plugins"
 import { removeCommand } from "#remove"
 import { restartCommand } from "#restart"
@@ -58,7 +61,15 @@ import { validateCommand } from "#validate"
 import { workspaceCommand } from "#workspace"
 
 function report(error: unknown): number {
-    if (error instanceof HarnessError) {
+    const missing = missingInterface(error)
+    if (missing !== undefined) {
+        process.stderr.write(
+            `cli_interface_missing: this command draws the terminal UI, and ${missing} is not installed.\n` +
+                `  hint: it is an optional dependency, left out by an install with --omit=optional. Reinstall without it (npm i -g ${BRAND.slug}), or pass --plain where the command has it.\n`,
+        )
+        return EXIT_FAILURE
+    }
+    if (isHarnessError(error)) {
         // `format()` prints the code, the field, the hint, and every sub-failure — so a command line
         // with two mistakes in it reports both rather than one at a time.
         process.stderr.write(`${error.format()}\n`)
@@ -143,6 +154,7 @@ async function dispatch(argv: readonly string[]): Promise<number> {
             const preset = flags.str("preset")
             const model = flags.str("model")
             const baseUrl = flags.str("base-url")
+            const region = flags.str("region")
             const apiKeyEnv = flags.str("api-key-env")
             const system = flags.str("system")
             const web = flags.str("web")
@@ -164,6 +176,7 @@ async function dispatch(argv: readonly string[]): Promise<number> {
                 ...(preset === undefined ? {} : { preset }),
                 ...(model === undefined ? {} : { model }),
                 ...(baseUrl === undefined ? {} : { baseUrl }),
+                ...(region === undefined ? {} : { region }),
                 ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
                 ...(system === undefined ? {} : { system }),
                 ...(web === undefined ? {} : { web }),
@@ -179,6 +192,7 @@ async function dispatch(argv: readonly string[]): Promise<number> {
                 ...(daemon === undefined ? {} : { daemon }),
                 yes: flags.bool("yes"),
                 plain: flags.bool("plain"),
+                measureWindow: flags.bool("measure-window"),
                 installServer: installServerUnit,
             })
         }
@@ -233,6 +247,19 @@ async function dispatch(argv: readonly string[]): Promise<number> {
                 json: flags.bool("json"),
                 clear: flags.bool("clear"),
                 turns: flags.bool("turns"),
+            })
+        }
+
+        case "owner": {
+            const store = flags.str("store")
+            return await ownerCommand({
+                // Positional 0 is the action, as for `memory`; the agent is positional 1.
+                action: manifestPath,
+                ...(positionals[1] === undefined
+                    ? {}
+                    : { manifestPath: resolveAgentRef(positionals[1]) }),
+                ...(store === undefined ? {} : { store }),
+                json: flags.bool("json"),
             })
         }
 
@@ -570,6 +597,8 @@ async function dispatch(argv: readonly string[]): Promise<number> {
 // the list is specific rather than "every ExperimentalWarning".
 quietAcceptedWarnings()
 installGuards()
+// Before anything reads the environment: `X_FILE` fills `X` for every reader (pilot.9).
+loadSecretFiles()
 
 // One way out for every route, so the terminal is restored and buffered output drains before the
 // process ends — and then the process actually ends.

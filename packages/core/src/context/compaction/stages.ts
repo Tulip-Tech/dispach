@@ -46,6 +46,7 @@
 
 import { derivedId } from "../../ids.ts"
 import type { ChatMessage } from "../../model/provider.ts"
+import { artifactPrefix, holdsUntrusted, type Trust } from "../../tools/trust.ts"
 import { estimateMessageTokens, estimateTokens } from "../tokens.ts"
 
 /**
@@ -121,9 +122,17 @@ export interface StageInput {
 
 const NO_DISPLACEMENTS: ReadonlyMap<number, Displaced> = new Map()
 
-/** `obs_<len>_<hash>`. Length is in the id so two hash collisions still have to agree on size. */
+/**
+ * `obs_<len>_<hash>`, or `obu_` when the content is fenced untrusted output. Length is in the id so two
+ * hash collisions still have to agree on size, and the prefix is what `artifact_read` reads its trust
+ * from.
+ */
 export function displacedId(content: string): string {
-    return derivedId("obs", content)
+    return artifactId(content, holdsUntrusted(content) ? "untrusted" : "trusted")
+}
+
+export function artifactId(content: string, trust: Trust): string {
+    return derivedId(artifactPrefix(trust), content)
 }
 
 /** What a message costs, matching `assembleContext`'s accounting including tool-call arguments. */
@@ -487,6 +496,27 @@ function requestSpine(
     const requests = history.slice(0, Math.max(0, upto)).filter(isTurnStart)
     if (requests.length === 0) return []
     return [{ role: "user", content: header, origin: "digest" }, ...requests]
+}
+
+/**
+ * A session checkpoint's messages (decision 15.21): `reset`'s output made durable, a digest of `span`
+ * and every request the person made in it. A digest already in the span is summarised with it, never
+ * kept as a request: it is the runtime's text, not the person's.
+ */
+export function checkpointMessages(
+    span: readonly ChatMessage[],
+    digest: string,
+): readonly ChatMessage[] {
+    const requests = span.filter((message) => isTurnStart(message) && message.origin !== "digest")
+    return [
+        digestMessage(digest),
+        ...(requests.length === 0
+            ? []
+            : [
+                  { role: "user", content: DIGEST_SPINE_HEADER, origin: "digest" } as const,
+                  ...requests,
+              ]),
+    ]
 }
 
 /**

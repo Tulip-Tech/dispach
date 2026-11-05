@@ -52,6 +52,9 @@ const MODEL_RESULT = {
     promptTokensReported: true,
     finishReason: "stop",
     latencyMs: 120,
+    callId: "mc_fixture",
+    model: "gpt-4o-mini",
+    role: "main",
 } as const
 
 function run(items: readonly TurnStreamItem[], from: Transcript = EMPTY): Transcript {
@@ -545,5 +548,39 @@ describe("a turn that failed says so", () => {
         ])
 
         expect(kinds(state)).toEqual(["reply", "note"])
+    })
+})
+
+describe("a call's detail", () => {
+    test("rides on the row only when the events carry it (tools.eventDetail: redacted)", () => {
+        const call = (args?: Record<string, unknown>) =>
+            event("tool.call", {
+                callId: "c1",
+                slug: "exec",
+                argsHash: "h",
+                mutating: true,
+                ...(args === undefined ? {} : { args }),
+            })
+        const result = (output?: string) =>
+            event("tool.result", {
+                callId: "c1",
+                slug: "exec",
+                ok: true,
+                latencyMs: 3,
+                bytes: 4000,
+                truncated: false,
+                trust: "untrusted",
+                ...(output === undefined ? {} : { output, outputTruncated: true }),
+            })
+        const tool = (state: Transcript) => state.rows.find((row) => row.kind === "tool")
+
+        expect(tool(run([call({ command: "ls" }), result("a\nb")]))).toMatchObject({
+            args: { command: "ls" },
+            output: "a\nb",
+            outputTruncated: true,
+        })
+        const bare = tool(run([call(), result()]))
+        expect(bare !== undefined && "args" in bare).toBe(false)
+        expect(bare !== undefined && "output" in bare).toBe(false)
     })
 })

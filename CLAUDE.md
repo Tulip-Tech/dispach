@@ -109,9 +109,11 @@ inbound (channel | API | schedule)
 
 **Non-obvious decisions you must not undo without reading the rationale:**
 
-- **NLT is the default tool dialect**, not native function calling. Published data: +14.9pp
-  accuracy, 93% fewer critical errors, −25% tokens across 14 models; +24 to +43pp on small
-  models specifically. `native` is an opt-in manifest field.
+- **`init` writes `native` where the registry knows the model calls tools natively, `nlt` otherwise**
+  (decision 14.125, revising 4.1). On the multi-turn harness benchmark native tied or beat NLT on 13
+  of 14 models, and NLT fell to 37–62% on five by announcing a call and not making it
+  (`evals/harness/`). The *schema* default is still `nlt`, so a manifest that omits the field behaves
+  as it always did; the published +14.9pp NLT result did not reproduce here.
 - **Dialect is config, never auto-detected.** Behaviour must not change silently when the
   model changes.
 - **Tools are pinned at load, not searched at runtime.** Search-then-execute is two-hop
@@ -177,8 +179,14 @@ packages/core/       the loop, context, tools, skills, memory, store, schedule, 
 packages/cli/        `dispach` binary — lib/ plumbing, components/ Ink, pure reducers at top level
 packages/server/     HTTP/SSE/WS surface
 packages/client/     typed client for the API — reattach, streams, typed errors
-packages/channel-*/  Telegram. A second channel comes from a plugin, not from here
-packages/tools-*/    system (shell, files), Composio, web. No MCP package exists — see decision 4.7
+packages/channel-*/  Telegram, WhatsApp, Teams (Bot Framework, webhook-only), Slack (Socket Mode), A2A (JSON-RPC, peers
+                     are agents: untrusted, acting for nobody). Each is a plugin the binary bundles
+packages/tools-*/    system (shell, files), Composio, web, MCP (remote servers over Streamable HTTP — a provider,
+                     never the substrate: decisions 4.7, 14.22)
+packages/model-*/    model transports beyond chat-completions: Bedrock Converse. Its AWS SDK loads on
+                     the first model call, never at boot (`bundle.test.ts` holds it)
+packages/media-*/    media providers beyond the built-in openai: Amazon Transcribe and Nova Canvas.
+                     Same lazy-SDK rule, same guard
 packages/control/    the control plane: places, proxies, suspends and wakes one runtime per user.
                      **FSL-1.1, not Apache-2.0.** Imports nothing from the runtime and nothing
                      imports it (`check:deps`); read its own CLAUDE.md before touching it
@@ -239,8 +247,13 @@ Never claim a performance property without a number in `evals/` and a script to 
   error anywhere.
 - **Pinned blocks must survive every compaction stage including S5.** Anything that must
   always hold lives in slots 0/1, never in history.
-- **Thinking blocks must be replayed with tool results** when `capabilities.thinking !== "none"`,
-  or multi-step reasoning silently degrades with no error.
+- **Signed thinking blocks are replayed with tool results** when `capabilities.thinking` is
+  `anthropic`, or multi-step reasoning silently degrades with no error. This bullet claimed it for
+  three phases before it existed: reasoning was a concatenated string that reached `turns.reasoning`
+  and nothing else. It is built since 26c. A transport emits `thinking_block` chunks, the loop puts
+  them on the assistant call **within the turn only** (never stored; the next turn starts a fresh
+  tool loop), and the transport replays them. `thinking-replay.test.ts` reads the second step's
+  request, because every layer can be right while the value is dropped between them.
 - **`allowFrom` is inbound-only.** It confers nothing on outbound delivery. Conflating these
   produces a confusing "chat not found" class of failure.
 - **A tool result is not automatically trustworthy.** `ToolSpec.trust` separates text the runtime wrote
@@ -1253,6 +1266,30 @@ Never claim a performance property without a number in `evals/` and a script to 
   Telegram username is `[A-Za-z0-9_]{5,32}`, so `@ada-lovelace` cannot exist and matching nobody is
   the only possible outcome. Everything downstream was correct behaviour applied to a wrong fact,
   which is the hardest kind of bug to see: nothing failed anywhere.
+- **A volume mounted inside another makes the container runtime create the missing parent as root.**
+  The workspaces volume at `~/.dispach/agents` inside the home volume left `~/.dispach` root-owned 0755,
+  where `fsGroup` does not reach, so uid 1000 could not create `store.db` and the pod crash-looped with
+  `store_open_failed`, whose hint talks about Node versions. Docker never shows it, because a named
+  volume is seeded from the image's own directories and a Kubernetes volume is not. Found only by
+  applying the example to a real cluster (k3s in Docker); the example's `layout` init container
+  creates the directory first, as the same non-root user.
+- **A tool-less agent has no tool runtime, so anything a *turn* brings needs one made for it.**
+  `submit_artifact` arrives as a turn tool and was layered only onto a runtime that existed, so a team
+  member or delegate with no tools of its own could never return an artifact — every handoff to one
+  failed as "finished without returning an answer". Every unit test gave its members tools; the image
+  run with a bare delegate found it. `#bareToolRuntime` is used only for such a turn, so a tool-less
+  agent's ordinary prompt keeps no catalogue.
+- **A reload's trial has to build what the swap builds.** It built the tool registry only, so
+  anything `Agent.create` refuses and the schema accepts — an unknown media provider, a workspace file
+  over budget — passed the trial, the old instance was disposed, the rebuild threw, and the agent was
+  simply gone from a running silo. Found by writing a bad `media` block through `PATCH /config` in the
+  image. The trial calls `instantiateAgent` with a scratch bus and discards it.
+- **A turn held for a reload must not count against the instance it is waiting to leave.** The swap
+  waits for the old instance's `inFlight` to reach zero, so a held turn that took a slot there is a turn
+  waiting on itself: the reload never lands and the turn never starts, with nothing reporting either.
+  The held admission is a promise of the successor instead (`DEFERRED` in `agent.ts`), and `send`
+  follows it — which is also why a channel queue or an HTTP handler holding a *stale* `Agent` reaches
+  the new instance with no change of its own. Revert-checked: counting it deadlocks the hold test.
 - **In a container every runtime is pid 1, so "is the holder's pid alive" answers about itself.** A
   container killed rather than stopped left a lease saying pid 1, and its replacement refused to
   serve for 45 minutes because pid 1 was alive. A holder with *our* pid is dead unless it is a
@@ -1436,11 +1473,19 @@ Never claim a performance property without a number in `evals/` and a script to 
   ladder often stops after `trim`, because `trim` reached the target — four tests failed asserting a digest
   had been written when the correct behaviour was not to write one. Forcing escalation needs a squeezed
   *history* budget (a large fixed part), not merely high pressure.
-- **Compaction rewrites the prompt, never the store.** A resumed session re-reads the whole conversation
-  and re-compacts it, so a turn whose pressure has fallen below `trim` shows a previously-snipped
-  observation in full again. Verified live. That is the right direction — the store is the audit trail —
-  but it means a pointer is not durable in the transcript and a test asserting "the marker is still there
-  next turn" is asserting something false.
+- **Compaction rewrites the prompt, never the messages — and a checkpoint is the one durable part.** A
+  resumed session re-reads the conversation and re-compacts it, so a turn whose pressure has fallen below
+  `trim` shows a previously-snipped observation in full again. Verified live. That is the right direction —
+  the store is the audit trail — but a pointer is not durable in the transcript and a test asserting "the
+  marker is still there next turn" is asserting something false. The cost of that design was found in
+  0.2.2: a session over `reset` re-ran `reset` on **every** turn, re-paying a compactor's digest each time
+  and warning "more than once" from the second. Decision 15.21 added `session_checkpoints`: a turn whose
+  `reset` fired, and `POST …/sessions/:key/compact`, save a digest plus the person's requests as what the
+  next turn starts from, through a message id. `messages` keeps every row, so the transcript, recall and
+  `memory_forget` are unchanged; only `#promptHistory` reads the checkpoint, and `history()` — the
+  screen's read — must not. The auto checkpoint keeps **one** turn, not `collapse`'s two: `reset` fired
+  because the last two did not fit, so keeping two leaves the next turn over `reset` again (measured in
+  `checkpoint.test.ts`, which reverts red without the save).
 - **Every marker the runtime writes must carry what it takes to act on it, and a placeholder in a prompt is
   an instruction.** `snip`'s marker said an observation "is still readable with artifact_read" and named no
   id; a live model correctly reported there was no id to pass and answered from the visible fragment.
@@ -1660,6 +1705,13 @@ Never claim a performance property without a number in `evals/` and a script to 
   behind a `--history` flag: `clear` wipes both, so an opt-in would make a plain rebuild delete every
   conversation and report success. `enumerateFiles` refuses a memory file named `session:*.md`, which
   would otherwise be dropped by whichever pass ran second and re-added by the other, forever.
+- **A shared memory scope is a separate corpus, never a third prefix, and private memory reaches a prompt two
+  ways.** Phase 29's scopes (`space`, `owner:<id>`, `project:<id>`) are indexed under `~<scope>` rather than
+  as sources in an agent's corpus, so `syncFiles` and `syncSessions` cannot see them and `syncNotes` may own
+  its whole corpus, provided it is handed the scope's whole note list every time. A turn barred from private
+  memory, a stand-in or a room, must also lose the **volatile tier**: `USER.md` and `MEMORY.md` are injected
+  every turn, so skipping recall alone still handed a stand-in every saved note. `memory-scopes.test.ts`
+  asserts both, and each goes red with its guard reverted.
 - **A retrieved conversation excerpt needs a different sentence from a retrieved note, and slot 2 needs a
   memory row.** Both were measured on the same live agent, and both are the "a fact with no frame is a fact
   a small model will not connect to a question" lesson again. With one frame for both, an agent holding
@@ -1695,9 +1747,10 @@ Never claim a performance property without a number in `evals/` and a script to 
   thing to *assert*: a `DELETE` missing its `WHERE agent_id = ?` passes every test that only ever puts
   one agent in the store, which is every test anybody writes by default. `store-purge.test.ts` populates
   two. Two consequences already load-bearing elsewhere: `memory_fts*` shadow tables are shared, which is
-  why ranking is computed in `rank/bm25.ts` rather than through FTS5's `bm25()`; and `kv` is the one
-  table with no `agent_id` **and no consumer anywhere**, so `purgeAgent` cannot clean up after it — dead
-  vocabulary, the `includeHistory` shape again, and now documented as such on the interface.
+  why ranking is computed in `rank/bm25.ts` rather than through FTS5's `bm25()`; and the `kv` table
+  was the one table with no `agent_id` **and no consumer anywhere**, so `purgeAgent` could never clean
+  up after it — dead vocabulary, the `includeHistory` shape again, removed by migration 32 rather
+  than carried.
 - **The store, the logs and the launchd label are keyed by the manifest `id`; the directory is keyed by
   its own name.** They are usually equal and need not be. Two directories with one id share one
   conversation history — `listAgents` already warned about it, and it is why `remove` *refuses* rather
@@ -1977,6 +2030,20 @@ Never claim a performance property without a number in `evals/` and a script to 
   structural rather than one test per field: `boundaries.test.ts` walks every `CommandSpec` flag and
   requires it to be named inside that command's **own** `case` block in `index.ts`. One guard, and a
   new flag is covered with nothing to remember.
+- **A row rebuilt as an object literal drops the field added after it was written.** Seventh instance:
+  `sessions` gained `head`, and both pickers in `run.ts` copied each row into a fresh literal naming the
+  fields they knew, so a conversation `/new` had set aside still read "You". Nothing type-checks it, because
+  the target type made `head` optional. The cure here was not a test per field: pass the rows through
+  unchanged, so no copy exists to drop one. Prefer that wherever a layer only forwards what it was given.
+  Eighth, found live a day later: the schedule `PATCH` rebuilt the stored row as a literal before
+  validating, so `{expr}` alone erased `tools`, `timeoutMs` and `maxSteps`, the three fields added
+  after it. Its guard writes every optional field, patches one, and requires the rest unmoved.
+- **A renderer that follows a turn by session key must follow the key the turn runs in, not the one it
+  sent.** Under `sessions.scope: owner` the server moves a terminal's `local:` key to `owner:<P>`, and
+  `run --plain` filtered every event of its own reply out, printing only the stats line — shipped in 0.2.2
+  and invisible in tests, which all used `channel-peer` or named the owner key. The CLI resolves once,
+  before the turn (`AgentSource.resolveSessionKey`; attached, `POST …/sessions/resolve`, the server's own
+  `sessionFor`), rather than copying the rule: a second copy of `resolveSessionKey` is a second answer.
 - **A reported symptom can be true with a false mechanism, and fixing the mechanism you assumed leaves
   the cause running.** "`init` always creates the agent inside the codebase" was accurate and had
   nothing to do with the default: driven under a pty against the *installed* binary, the wizard offers
@@ -2031,6 +2098,23 @@ Never claim a performance property without a number in `evals/` and a script to 
   addition" — derive bodies from the schemas, and guard the one hand-written part (a summary per
   route) in **both** directions. A summary for a route nothing registers is worse than a missing
   one, because a reference describing an endpoint that answers 404 looks authoritative.
+- **A fact typed twice is a fact that is wrong in one place, and the docs typed every fact twice.** An
+  outside reader found four mistakes on the public site in five minutes: the hero's `npm install` led to
+  a page that built from source; the HTTP reference showed `202 Empty` for the route whose body is the
+  one handle a client must keep, because `openapi.ts` omitted *every* response body on the theory that
+  the client's types were checked (`.json() as T` checks nothing); the API reference was reachable only
+  through the section switcher; and the landing badge, the docs home and the sidebar named three
+  different releases. Everything derived from `packages/cli/package.json` was right and everything typed
+  by hand was stale. So **`scripts/facts.ts` is the one source**: prose carries
+  `<!-- fact:NAME -->value<!-- /fact -->` (version, Node floor, image, endpoint count, console pages, any
+  `default:<manifest.path>`), copyable text is matched by pattern, `bun run release` rewrites both and
+  `docs:check` fails on a stale copy; the history files are exempt because rewriting them would falsify
+  history. The reference now declares response schemas and the server harness parses every response the
+  suite produces against them. Two rules generalise: **an omitted part of a generated document reads as
+  a fact** ("Empty"), never as an omission; and **a new kind of doc fact gets a check, not a promise** —
+  `check-docs.ts` now also fails on a local link that is no site route, a `/docs/…` href in `site/` that
+  names no page, a landing quickstart that never shows the install the hero prints, and an operation with
+  no response body.
 - **Measure a dependency's payload before writing a sentence about it.** I wrote "several hundred
   kilobytes" about Scalar's bundle twice; it is **3.6 MB raw, 1.0 MB gzipped** — sixteen times this
   project's entire UI at 220 KB. The number is what decides CDN versus vendoring, so guessing it
@@ -2243,7 +2327,9 @@ Never claim a performance property without a number in `evals/` and a script to 
   rule is not "add a binary test": it is **`instanceof` only where the throw and the catch are in one
   package**, `isHarnessError` (a `Symbol.for` mark, identical across copies by construction)
   everywhere else, and a boundaries test in `packages/server` refusing `instanceof HarnessError`
-  outright because every `catch` there is catching a foreign error. The mark is set in the constructor
+  outright because every `catch` there is catching a foreign error. The CLI has the same guard since
+  26d, after the image printed a public-bind refusal (`server_public_without_token`, whose hint names the
+  token) as `server_bind_failed`, claiming every port in the range was taken. The mark is set in the constructor
   rather than declared as a field: a symbol-keyed field reaches the `.d.ts` and makes the class
   *nominal*, at which point `tsc` reports the same duplication — a real finding, and the wrong place
   to spend it. The guard that works without a bundler imports the built `dist` beside the source, which

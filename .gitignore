@@ -42,6 +42,11 @@ local_test/
 11-*.md
 14-*.md
 15-*.md
+16-*.md
+18-*.md
+19-*.md
+20-*.md
+21-*.md
 # Generated at build time from the root README — it is the npm page, and a second
 # hand-maintained copy is drift waiting to happen.
 packages/cli/README.md
@@ -49,3 +54,9 @@ packages/cli/README.md
 
 # The control plane's default database, if it is started from the repository root.
 control.db*
+
+# Weekly launch counts, from scripts/launch-metrics.ts
+.metrics/
+# Browser-automation output
+.playwright-mcp/
+dist-standalone/

@@ -44,21 +44,42 @@ export const ModelCapabilitiesSchema = z
         nativeTools: z.boolean().optional(),
         strictSchema: z.boolean().optional(),
         thinking: z.enum(["none", "anthropic", "openai", "deepseek"]).optional(),
-        promptCache: z.enum(["none", "anthropic", "openai"]).optional(), // deepseek has no prompt cache, server-side -> refer packages/core/src/model/capabilities.ts
+        promptCache: z.enum(["none", "anthropic", "openai", "bedrock"]).optional(), // deepseek has no prompt cache, server-side -> refer packages/core/src/model/capabilities.ts
         parallelToolCalls: z.boolean().optional(),
         contextWindow: z.number().int().positive().optional(),
         maxOutput: z.number().int().positive().optional(),
+        vision: z.boolean().optional(),
         /** Merged field by field over the shipped default — set one without restating the rest. */
         promptStyle: PromptStyleSchema.optional(),
     })
     .strict()
 
-export const ModelRoleSchema = z
+/** The transport every manifest used before `api` existed, and the default when it is omitted. */
+export const DEFAULT_MODEL_API = "chat-completions"
+
+const ModelRoleFields = z
     .object({
         /** Sent verbatim as the `model` parameter. */
         id: z.string().min(1),
-        /** Must end at the version segment; the runtime appends `/chat/completions`. */
-        baseUrl: z.string().min(1),
+        /**
+         * Which transport speaks to this model. Omitted, it is `chat-completions` — every manifest
+         * written before this field existed, unchanged. Another value names a transport a plugin
+         * registered with `defineModelTransport` (`bedrock-converse` from the Bedrock package); an
+         * unknown one refuses the load rather than falling back, the same rule as an unknown tool.
+         */
+        api: z.string().min(1).optional(),
+        /**
+         * Transport-specific settings, validated by that transport's own schema at load (for
+         * Bedrock: `region`, `profile`). Never a credential: a transport reads those from its
+         * environment, the way `apiKeyEnv` names a variable rather than holding a key.
+         */
+        options: z.record(z.string(), z.unknown()).optional(),
+        /**
+         * Must end at the version segment; the runtime appends `/chat/completions`. Required for
+         * `chat-completions`; a transport that addresses its endpoint another way (a region) may
+         * omit it.
+         */
+        baseUrl: z.string().min(1).optional(),
         /** The *name* of an env var. A literal key here fails validation. */
         apiKeyEnv: z.string().min(1).optional(),
         temperature: z.number().min(0).max(2).optional(),
@@ -76,20 +97,52 @@ export const ModelRoleSchema = z
          * Not universally honoured, and an endpoint that ignores it says nothing. Verify per
          * endpoint rather than assuming.
          */
-        reasoningEffort: z.enum(["none", "minimal", "low", "medium", "high"]).optional(),
+        reasoningEffort: z
+            .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+            .optional(),
         headers: z.record(z.string(), z.string()).optional(),
         /**
          * Ask the endpoint to report token usage in a streamed response.
          *
-         * `stream_options` is an OpenAI extension, so it is off by default: an endpoint that does
-         * not know it may reject the request outright. Measured: Ollama honours it and reports
-         * nothing without it, so a local model's token counts come from the estimator until this is
-         * set — which matters the moment a number is being compared rather than displayed.
+         * On by default (since Phase 7A); `false` stops asking. `stream_options` is an OpenAI
+         * extension, so an endpoint that does not know it may reject the request: a 400 naming
+         * `stream_options` is retried once without it and remembered (`model/chat-completions.ts`).
+         * Measured: Ollama honours it and reports nothing without it, so without usage a local
+         * model's token counts come from the estimator alone.
          */
         streamUsage: z.boolean().optional(),
         capabilities: ModelCapabilitiesSchema.optional(),
     })
     .strict()
+
+/** `baseUrl` is optional in the shape and required for the transport that cannot work without one. */
+function requireBaseUrl(
+    role: { readonly api?: string | undefined; readonly baseUrl?: string | undefined },
+    ctx: z.RefinementCtx,
+): void {
+    if ((role.api ?? DEFAULT_MODEL_API) === DEFAULT_MODEL_API && role.baseUrl === undefined) {
+        ctx.addIssue({
+            code: "custom",
+            path: ["baseUrl"],
+            message: "baseUrl is required for the chat-completions transport",
+        })
+    }
+}
+
+/** One `fallbacks` entry: a complete role of its own, minus a chain of its own. */
+const ModelFallbackSchema = ModelRoleFields.superRefine(requireBaseUrl)
+
+export const ModelRoleSchema = ModelRoleFields.extend({
+    /**
+     * Tried in order when this role's model fails in a way that is the endpoint's rather than the
+     * request's — unreachable, a 5xx, or 408/429 once its retries are spent — and only before the
+     * first chunk. Never on a 4xx the caller caused and never on a 403, which an embedder may use as
+     * its budget stop. Each entry is a whole role (id, api, baseUrl or options, key), so a fallback
+     * can be another provider entirely. The primary's capabilities, dialect and window still apply:
+     * a fallback is a stand-in for the same job, and `validate` warns when one is smaller.
+     */
+    fallbacks: z.array(ModelFallbackSchema).min(1).optional(),
+}).superRefine(requireBaseUrl)
 
 export const ModelSchema = z
     .object({
@@ -225,7 +278,14 @@ export const ContextSchema = z
         /** Total token budget. Defaults to the model's `contextWindow` capability. */
         window: z.number().int().positive().optional(),
         reserveOutput: z.number().int().positive().default(4096),
-        observationMaxTokens: z.number().int().positive().default(2000),
+        /** Absent means sized from the window — `observationBudget` in `context/budget.ts`. */
+        observationMaxTokens: z.number().int().positive().optional(),
+        /**
+         * Whether the agent may see which model it runs on (pilot.15). `hidden` drops the
+         * model and media ids, endpoints, transports and key names from the prompt and from
+         * `config_read`; everything else stays readable and settable. Events and the API keep them.
+         */
+        modelIdentity: z.enum(["shown", "hidden"]).default("shown"),
         /**
          * **Deprecated from Phase 3.5** — an alias for `static`, warning at load.
          *
@@ -238,7 +298,7 @@ export const ContextSchema = z
         workspace: z.string().min(1).default("./workspace"),
         /** Tier 0, slot 0. Cache-stable, read-only, before breakpoint A. */
         static: z.array(z.string().min(1)).default([]),
-        /** Tier 1, slot 3. Writable, *after* breakpoint A so a write leaves the cache intact. */
+        /** Tier 1, slot 4. Writable, *after* breakpoint A so a write leaves the cache intact. */
         volatile: z.array(z.string().min(1)).default([]),
         /** Tier 2, slot 9. After the history, before the current input. One or two rules. */
         reminder: z.string().min(1).optional(),
@@ -246,7 +306,7 @@ export const ContextSchema = z
         rules: RulesSchema.prefault({}),
         /** Capability-gated long-form identity, with `requires` and `onUnmet`. */
         soul: SoulSchema.optional(),
-        /** Runtime-generated line about automatic compaction. Phase 7; refused until then. */
+        /** Runtime-generated line about automatic compaction, rendered into slot 2. */
         compactionNotice: z.boolean().optional(),
         thresholds: ThresholdsSchema.prefault({}),
     })
@@ -321,6 +381,13 @@ export const ToolsSchema = z
         local: z.array(z.string().min(1)).default([]),
         untrusted: ToolsUntrustedSchema.prefault({}),
         policy: ToolsPolicySchema.prefault({}),
+        /**
+         * What `tool.call` and `tool.result` carry (pilot.5). `none` is the hash and
+         * the size, as always. `redacted` adds the arguments and the first 2 KB of the output, with
+         * values under secret-looking keys and the values of secret-named environment variables
+         * replaced. Person-only: it decides what every event subscriber and webhook receives.
+         */
+        eventDetail: z.enum(["none", "redacted"]).default("none"),
     })
     .strict()
 
@@ -343,6 +410,13 @@ export const SkillsSchema = z
          * changing that formula invalidates this default, and both sides say so.
          */
         threshold: z.number().default(0.35),
+        /**
+         * The skills whose scripts may run (pilot.14). Absent, every skill's do, as before;
+         * present, a skill not named here is still selected and read, but its scripts are not tools.
+         * The operator's list: a skill arriving by `git pull` or a person's upload cannot add itself,
+         * and `config_set` cannot change it.
+         */
+        trusted: z.array(z.string().min(1)).optional(),
         // No `budget`, and its absence is the design (decision 11.59). A per-turn token cap on skills
         // only ever converted "the right procedure" into "no procedure": `maxActive` already bounds a
         // turn to one body, so the second limit added no protection and produced a refusal at install,
@@ -360,7 +434,7 @@ export const SkillsSchema = z
 export const MemorySchema = z
     .object({
         /**
-         * Which retriever backs slot 7. Only `fts5` exists; an unknown name is refused at load with
+         * Which retriever backs slot 10. Only `fts5` exists; an unknown name is refused at load with
          * the known ones named, rather than silently retrieving nothing.
          *
          * A string rather than an enum because `MemoryRetriever` is a function-shaped seam and the
@@ -418,12 +492,35 @@ export const MemorySchema = z
          *
          * **Tool observations are never indexed, at any setting.** That is where untrusted text lives —
          * a fetched page, a provider result — and indexing it would make prompt injection *durable*:
-         * text a stranger wrote, retrieved into slot 7 in a later session, long after the write gate
+         * text a stranger wrote, retrieved into slot 10 in a later session, long after the write gate
          * that fenced it stopped applying. `ChatMessage.origin` is what makes the distinction reliable,
          * since under a text dialect an observation comes back as a `user` message and the role does
          * not say.
          */
         includeHistory: z.boolean().default(true),
+        /**
+         * Read and write `agents:<owner>`, the memory this agent's owner's agents share (decision 15.8).
+         * Only matters when the agent is assigned. `false` opts out both ways: `memory_write` stays
+         * private and the pool is never read. `docs/23-SPEC-SESSIONS.md`.
+         */
+        shared: z.boolean().default(true),
+    })
+    .strict()
+
+/**
+ * How a turn's session key is chosen (decision 15.6, `docs/23-SPEC-SESSIONS.md`).
+ *
+ * `channel-peer` is the default and is what every surface did before: the key sent is the key used.
+ * `owner` puts every turn from the assigned owner — any channel, the web, the terminal — in one
+ * conversation; `peer` does the same for each registered participant. The default does not move:
+ * embedders choose and parse their own keys, and `init` writes `owner` into what it generates.
+ */
+export const SESSION_SCOPES = ["owner", "peer", "channel-peer"] as const
+export type SessionScope = (typeof SESSION_SCOPES)[number]
+
+export const SessionsSchema = z
+    .object({
+        scope: z.enum(SESSION_SCOPES).default("channel-peer"),
     })
     .strict()
 
@@ -438,6 +535,13 @@ export const ChannelSchema = z
         /** Inbound allowlist. `["*"]` permits anyone. Inbound only — no effect on delivery. */
         allowFrom: z.array(z.string().min(1)).optional(),
         enabled: z.boolean().default(true),
+        /**
+         * A model role declared under `model:` that this channel's turns run on (pilot.14,
+         * OpenClaw's `modelByChannel`): WhatsApp on a cheaper model than the web chat. Absent is
+         * `main`, as before. A role that is not declared refuses the manifest rather than falling
+         * back, for the reason a schedule's `role:` does.
+         */
+        role: slug.optional(),
     })
     .passthrough()
 
@@ -447,6 +551,12 @@ export const DeliverySchema = z
     .object({
         /** Channel used when a turn has no origin — schedules, API-initiated turns. */
         default: slug.optional(),
+        /**
+         * What a channel reply carries (pilot.14). `all`, the default, is every step's prose
+         * joined, as before. `final` is the last step's alone (`finalText`) when there is one, so a
+         * lead-in the model repeats before each tool call reaches the person once.
+         */
+        reply: z.enum(["all", "final"]).default("all"),
         targets: z.record(z.string(), DeliveryTargetSchema).default({}),
     })
     .strict()
@@ -537,6 +647,173 @@ export const TeamSchema = z
     })
     .strict()
 
+/**
+ * A throwaway child of this agent that runs a routed tool call in a context of its own (pilot.6), or a
+ * task the model hands it with `delegate` when it declares `spawn: true` (decision 15.20).
+ *
+ * Routing is the harness's decision, never the model's: when the parent calls a slug under
+ * `route.tools`, the policy and the write gate decide as they always do, and only then does the child
+ * run instead of the tool. The parent's observation is the child's artifact, not the raw output.
+ *
+ * `tools` names slugs exactly, and each must be one the parent pins or lists under `tools.local`: a
+ * child only ever narrows the parent's authority (decision 10.5). Checked in `validateManifest`, so
+ * `validate` refuses what `run` would.
+ */
+export const SubagentSchema = z
+    .object({
+        name: slug,
+        /** What the child is for. Rendered into its task ahead of the call it was handed. */
+        task: z.string().min(1),
+        tools: z.array(z.string().min(1)).min(1),
+        /** The slugs whose calls run this child. Optional when `spawn` is set; one of the two is required. */
+        route: z
+            .object({ tools: z.array(z.string().min(1)).min(1) })
+            .strict()
+            .optional(),
+        /**
+         * The model may start this child itself, with `delegate` (`docs/25-SPEC-FAN-OUT.md`, decision
+         * 15.20). Opt-in per child: routing stays the harness's decision for every child that does not
+         * say so.
+         */
+        spawn: z.boolean().default(false),
+        /** The artifact's schema. Absent: `{summary}`. */
+        artifact: TeamMemberSchema.shape.artifact.optional(),
+        /** A model role for this child. Absent: `model.subagent` when declared, else `main`. */
+        model: z.string().min(1).optional(),
+        /** Lowers the parent's `limits.maxSteps` for the child, never raises it. */
+        maxSteps: z.number().int().positive().optional(),
+        /**
+         * The routed call's bound in milliseconds, in place of `limits.toolTimeoutMs` for this child's
+         * `route.tools` (pilot.15), and the bound on each `delegate` task this child runs. A child reading fifteen messages one call at a time needs
+         * longer than one tool should be given, and raising the tool bound would raise it for `exec`
+         * too. The child is still ended a second before it, so it reports a timeout.
+         */
+        timeoutMs: z.number().int().positive().optional(),
+    })
+    .strict()
+
+/**
+ * One media capability: which provider does it, with what model, bounded by a hard timeout.
+ *
+ * `provider` names a media provider the way `api` names a model transport — `openai` is built in (any
+ * endpoint speaking `/audio/transcriptions` and `/images/generations`), `aws` comes from the
+ * `media-aws` plugin (Amazon Transcribe, Nova Canvas), and an unknown one refuses the load.
+ */
+const MediaSectionFields = {
+    provider: z.string().min(1),
+    /** Sent to the provider as its model id: `whisper-1`, `gpt-image-1`, `amazon.nova-canvas-v1:0`. */
+    model: z.string().min(1).optional(),
+    /** For `openai`: the endpoint's base URL ending at the version segment. */
+    baseUrl: z.string().min(1).optional(),
+    /** The *name* of an env var. A literal key here fails validation. */
+    apiKeyEnv: z.string().min(1).optional(),
+    /** Provider-specific settings, validated by that provider (for `aws`: `region`, `languageCode`). */
+    options: z.record(z.string(), z.unknown()).optional(),
+}
+
+export const MediaSchema = z
+    .object({
+        /**
+         * Voice notes on channels become text before the turn. The timeout covers the download and
+         * the transcription together and is **hard**: a provider that never answers is abandoned and
+         * the sender is told, because a hung transcription holds that conversation's queue and
+         * silences the person for good.
+         */
+        transcription: z
+            .object({
+                ...MediaSectionFields,
+                timeoutMs: z.number().int().positive().default(60_000),
+                /** A voice note larger than this is refused before it is downloaded. */
+                maxBytes: z
+                    .number()
+                    .int()
+                    .positive()
+                    .default(25 * 1024 * 1024),
+            })
+            .strict()
+            .optional(),
+        /**
+         * Speaks the reply to a voice note as a voice note too (pilot.15), after the text,
+         * on a channel that can carry one. Only a turn that began as a voice note is answered in
+         * audio; typed messages are never spoken to. The provider returns Ogg/Opus, which is what a
+         * WhatsApp or Telegram voice note is.
+         */
+        speech: z
+            .object({
+                ...MediaSectionFields,
+                timeoutMs: z.number().int().positive().default(60_000),
+                /**
+                 * Characters per voice note. A longer reply becomes several notes split at sentence
+                 * ends rather than being cut: 3,000 is Polly's limit for one request.
+                 */
+                maxCharacters: z.number().int().positive().default(3000),
+            })
+            .strict()
+            .optional(),
+        /** Declaring it registers the `image_generate` tool; images land in the agent's `media/`. */
+        image: z
+            .object({
+                ...MediaSectionFields,
+                timeoutMs: z.number().int().positive().default(120_000),
+                /** `WIDTHxHEIGHT`, passed to the provider. */
+                size: z
+                    .string()
+                    .regex(/^[0-9]+x[0-9]+$/)
+                    .default("1024x1024"),
+            })
+            .strict()
+            .optional(),
+    })
+    .strict()
+
+/**
+ * Answering for the owner while they are away (Phase 28). Only in a DM between two people, and only
+ * for the human the agent is assigned to. Off unless declared.
+ */
+export const StandInSchema = z
+    .object({
+        enabled: z.boolean().default(false),
+        /**
+         * How long after a message to an offline owner the agent answers for them. 0 answers at once.
+         * The owner coming online, or replying, before then cancels it.
+         */
+        escalateAfterMs: z.number().int().nonnegative().default(0),
+    })
+    .strict()
+
+/**
+ * Handing work to other members' agents in the same silo (Phase 28). A target declares what it
+ * offers; a coordinator declares whom it may use. The handoff that results is the team one: a fresh
+ * session, a typed artifact, the same depth limit.
+ */
+export const DelegationSchema = z
+    .object({
+        /** What this agent takes on for others: a task line and the artifact it returns. */
+        offer: z
+            .object({
+                task: z.string().min(1),
+                artifact: z
+                    .object({
+                        type: z.literal("object"),
+                        properties: z.record(z.string(), JsonSchemaNodeSchema),
+                        required: z.array(z.string()).optional(),
+                    })
+                    .strict(),
+            })
+            .strict()
+            .optional(),
+        /** The agents this one may delegate to, by id, or "*" for every agent that offers. */
+        to: z.union([z.literal("*"), z.array(slug).min(1)]).optional(),
+        /**
+         * Free-form asks between one person's agents (`ask_agent`, decisions 15.9 and 15.15;
+         * `docs/24-SPEC-PEER-ASK.md`). Both sides opt in: an agent is offered another that declares it
+         * too and is assigned to the same person, or to nobody (a shared agent). Off unless declared;
+         * `init` writes it on.
+         */
+        ask: z.boolean().default(false),
+    })
+    .strict()
+
 export const ScheduleSchema = z
     .object({
         id: slug,
@@ -556,6 +833,18 @@ export const ScheduleSchema = z
          * author wrote something they did not.
          */
         role: slug.optional(),
+        /**
+         * Limits for this schedule's runs (pilot.5). They only narrow what the agent already has:
+         * `tools.allow` selects from its catalogue with the phase grammar (`slug`, `tag:read`, `*`),
+         * and the two numbers are capped by `limits`. A schedule may be written by the agent itself
+         * (`config_set`), so one that could raise them would be a way round its own budget.
+         */
+        tools: z
+            .object({ allow: z.array(z.string().min(1)).min(1) })
+            .strict()
+            .optional(),
+        timeoutMs: z.number().int().positive().optional(),
+        maxSteps: z.number().int().positive().optional(),
         enabled: z.boolean().default(true),
         /** IANA name. Defaults to `TZ`, then UTC. */
         timezone: z.string().min(1).optional(),
@@ -590,6 +879,13 @@ export const NoProgressSchema = z
          * is often correct — a transient failure deserves one more try. Three is a pattern.
          */
         identicalCalls: z.number().int().min(2).default(3),
+        /**
+         * Calls to any one tool in a turn, whatever the arguments, before it ends as `no_progress`
+         * (pilot.13). Absent is no limit, which is what every turn had before. For churn the
+         * identical-call check cannot see: a mail delta or a CRM lookup called forty times with new
+         * arguments each time.
+         */
+        sameTool: z.number().int().min(2).optional(),
     })
     .strict()
 
@@ -617,6 +913,20 @@ export const LimitsSchema = z
          * queued — `429` over the wire, the refusal text on a channel, an error on a schedule run.
          */
         maxConcurrentTurns: z.number().int().positive().optional(),
+        /**
+         * How long a pending reload lets new turns keep running on the old configuration, in ms,
+         * before they wait for the swap instead. Turns already running always finish on the old one;
+         * this bound is what stops a constantly busy agent postponing a reload forever. 0 holds new
+         * turns at once.
+         */
+        reloadHoldMs: z.number().int().nonnegative().default(30_000),
+        /**
+         * In a room, how many agent replies deep a message may be and still make this agent answer
+         * (Phase 27). A human's message is hop 0; each agent reply is one more. Past it the agent
+         * reads the message and does not answer, and `conversation.skipped` says why — the guard
+         * against two agents replying to each other forever.
+         */
+        maxHops: z.number().int().nonnegative().default(4),
         /**
          * Model tokens (prompt + output, every call the meter records) this agent may spend in a
          * rolling window. Checked when a turn **starts**: a turn under the budget runs to its end, so
@@ -666,8 +976,29 @@ export const ServerSchema = z
 export const AgentManifestSchema = z
     .object({
         apiVersion: z.string().min(1),
-        id: slug,
+        // `~` is reserved: a shared memory scope's corpus key starts with one (`memory/scopes.ts`), and
+        // an agent sharing that key would read and reconcile a team's notes as its own.
+        id: slug.refine((value) => !value.startsWith("~"), {
+            message:
+                "An agent id may not start with `~`; that prefix is reserved for shared memory scopes.",
+        }),
         name: z.string().min(1).optional(),
+        /**
+         * What this agent is for, in one line (decision 15.15). Shown beside its id to the agents that
+         * may ask it (`ask_agent`), in `GET /v1/agents` and in the console. One line because it is
+         * rendered into a tool description, where a line break splits a listing.
+         */
+        description: z
+            .string()
+            .min(1)
+            .max(200, {
+                message:
+                    "A description is one line of at most 200 characters; it is rendered into every peer's ask_agent description.",
+            })
+            .refine((value) => !/[\r\n]/.test(value), {
+                message: "A description is one line; put the detail in AGENTS.md.",
+            })
+            .optional(),
         /** Path to a base manifest. Shallow merge; arrays replace. */
         extends: z.string().min(1).optional(),
 
@@ -678,10 +1009,15 @@ export const AgentManifestSchema = z
         skills: SkillsSchema.optional(),
         knowledge: KnowledgeSchema.optional(),
         memory: MemorySchema.optional(),
+        sessions: SessionsSchema.optional(),
         channels: z.array(ChannelSchema).default([]),
         delivery: DeliverySchema.optional(),
         schedules: z.array(ScheduleSchema).default([]),
         team: TeamSchema.optional(),
+        subagents: z.array(SubagentSchema).optional(),
+        media: MediaSchema.optional(),
+        standIn: StandInSchema.optional(),
+        delegation: DelegationSchema.optional(),
         plugins: z.array(PluginRefSchema).default([]),
         limits: LimitsSchema.prefault({}),
         server: ServerSchema.prefault({}),
@@ -701,11 +1037,19 @@ export type SkillsConfig = z.infer<typeof SkillsSchema>
 export type KnowledgeConfig = z.infer<typeof KnowledgeSchema>
 export type SoulConfig = z.infer<typeof SoulSchema>
 export type MemoryConfig = z.infer<typeof MemorySchema>
+export type SessionsConfig = z.infer<typeof SessionsSchema>
 export type ChannelConfig = z.infer<typeof ChannelSchema>
 export type DeliveryConfig = z.infer<typeof DeliverySchema>
 export type ScheduleConfig = z.infer<typeof ScheduleSchema>
 export type TeamMemberConfig = z.infer<typeof TeamMemberSchema>
 export type TeamConfig = z.infer<typeof TeamSchema>
+export type SubagentConfig = z.infer<typeof SubagentSchema>
+export type MediaConfig = z.infer<typeof MediaSchema>
+export type StandInConfig = z.infer<typeof StandInSchema>
+export type DelegationConfig = z.infer<typeof DelegationSchema>
+export type TranscriptionConfig = NonNullable<MediaConfig["transcription"]>
+export type ImageConfig = NonNullable<MediaConfig["image"]>
+export type SpeechConfig = NonNullable<MediaConfig["speech"]>
 export type PluginRef = z.infer<typeof PluginRefSchema>
 export type LimitsConfig = z.infer<typeof LimitsSchema>
 export type ServerConfig = z.infer<typeof ServerSchema>

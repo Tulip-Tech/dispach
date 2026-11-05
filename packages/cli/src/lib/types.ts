@@ -74,6 +74,24 @@ export interface TranscriptItem {
     readonly callId?: string
     /** A tool row still waiting for its result. Drawn as running rather than as finished. */
     readonly pending?: boolean
+    /**
+     * The subagents this call ran, each drawn as a block under the tool row: one for a routed call
+     * (pilot.6), one per task for `delegate` (decision 15.20), in task order.
+     */
+    readonly subagents?: readonly SubagentView[]
+}
+
+export interface SubagentView {
+    readonly name: string
+    /** A `delegate` task's label and position in its call. Absent for a routed call. */
+    readonly label?: string
+    readonly index?: number
+    /** The child's own session, which is how its events find this row. */
+    readonly sessionKey: string
+    /** The child's tool calls, in order, each completed in place by its result. */
+    readonly lines: readonly { readonly callId?: string; readonly text: string }[]
+    /** `2 steps · 1.2k tokens · ok`, once the child has finished. */
+    readonly summary?: string
 }
 
 /**

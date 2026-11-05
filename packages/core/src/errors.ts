@@ -21,6 +21,16 @@ export interface ErrorDetail {
     readonly hint: string
     /** Dotted path into the manifest, where applicable: `tools.pinned[2]`. */
     readonly field?: string
+    /**
+     * A provider's own words, verbatim, for an operator (pilot.14). Kept out of `message`, which an
+     * embedder shows to people: AWS's text names the assumed-role ARN and the account.
+     */
+    readonly detail?: string
+    /**
+     * Each failure, when one error stands for several: a manifest that broke two rules. Absent for a
+     * single failure, whose own fields already say it.
+     */
+    readonly details?: readonly ErrorDetail[]
 }
 
 export interface HarnessErrorInit {
@@ -28,6 +38,7 @@ export interface HarnessErrorInit {
     message: string
     hint: string
     field?: string
+    detail?: string
     cause?: unknown
     /** Sub-failures, when one load surfaces several independent problems at once. */
     details?: ErrorDetail[]
@@ -74,6 +85,11 @@ export class HarnessError extends Error {
     readonly code: string
     readonly hint: string
     readonly field: string | undefined
+    /**
+     * Declared, not a field initialiser: set only when there is one, so an error without it prints
+     * exactly as before instead of with a `detail: undefined` line.
+     */
+    declare readonly detail?: string
     readonly details: ErrorDetail[]
 
     constructor(init: HarnessErrorInit) {
@@ -111,13 +127,21 @@ export class HarnessError extends Error {
         this.code = init.code
         this.hint = init.hint
         this.field = init.field
+        if (init.detail !== undefined) (this as { detail?: string }).detail = init.detail
         this.details = init.details ?? []
     }
 
     toDetail(): ErrorDetail {
-        return this.field === undefined
-            ? { code: this.code, message: this.message, hint: this.hint }
-            : { code: this.code, message: this.message, hint: this.hint, field: this.field }
+        return {
+            code: this.code,
+            message: this.message,
+            hint: this.hint,
+            ...(this.field === undefined ? {} : { field: this.field }),
+            ...(this.detail === undefined ? {} : { detail: this.detail }),
+            // The hint of a multi-failure error says "each failure below", so the list has to travel
+            // with it: without it an HTTP caller got the count and a pointer to nothing.
+            ...(this.details.length > 1 ? { details: this.details } : {}),
+        }
     }
 
     /** Multi-line, for a terminal. The wire surface uses `toDetail()` instead. */
@@ -125,6 +149,7 @@ export class HarnessError extends Error {
         const lines = [`${this.code}: ${this.message}`]
         if (this.field !== undefined) lines.push(`  field: ${this.field}`)
         lines.push(`  hint: ${this.hint}`)
+        if (this.detail !== undefined) lines.push(`  detail: ${this.detail}`)
 
         // A single failure is already fully described by the summary above — the wrapper adopts
         // its message, field, and hint. Printing it twice makes one problem look like two.
@@ -401,6 +426,32 @@ export function unknownToolAtRuntime(slug: string, known: readonly string[]): To
 }
 
 /**
+ * An owner or peer session scope with nobody assigned (decision 15.14). Not a load failure: the agent
+ * still answers, one conversation per surface, and this says why that is.
+ */
+export function sessionsScopeUnassigned(agentId: string, scope: string): ErrorDetail {
+    return {
+        code: "sessions_scope_unassigned",
+        message: `sessions.scope is "${scope}", and nobody is assigned to agent "${agentId}", so each surface keeps its own conversation.`,
+        hint: `The scope merges a person's conversations, and an agent with no owner has nobody to merge them for. Run \`${BRAND.slug} owner adopt ${agentId}\` to make you its owner, or assign one with PUT /v1/agents/${agentId}/assignee. Set sessions.scope to "channel-peer" to make the manifest say what happens.`,
+        field: "sessions.scope",
+    }
+}
+
+/**
+ * A compaction asked of a session too short to have anything before its kept turns (decision 15.21).
+ * A 409 on the route: the request was understood and the session is not in a state to do it.
+ */
+export function sessionTooShort(sessionKey: string, turns: number, keep: number): HarnessError {
+    return new HarnessError({
+        code: "session_too_short",
+        message: `Session ${sessionKey} has ${turns} turn(s) since it was last compacted, and ${keep} are kept, so there is nothing to compact.`,
+        hint: "Compact it once it is longer, or keep fewer turns with keepTurns (at least 1).",
+        field: "keepTurns",
+    })
+}
+
+/**
  * A pinned tool that this configuration allows exactly once per turn.
  *
  * A tool that both changes things and returns text from outside the conversation taints the turn with
@@ -438,10 +489,19 @@ export function toolBudgetExceeded(requested: number, max: number): ConfigError 
  * — so the loop would have to guess which tool was meant. Under NLT the same slug is fine, which is
  * why this is a dialect error and not a registry one.
  */
+export function nativeToolNameCollision(mapped: string, other: string): ConfigError {
+    return new ConfigError({
+        code: "native_tool_name_collision",
+        message: `The tool "${mapped}" is sent to a native endpoint as "${mapped.replaceAll(".", "__")}", which can't be told apart from "${other}" when the model calls it.`,
+        hint: "Rename one of the two (a skill or script name, usually), or use tools.dialect: nlt, which sends slugs as written.",
+        field: "tools.dialect",
+    })
+}
+
 export function nativeToolNameInvalid(slug: string, provider: string): ConfigError {
     return new ConfigError({
         code: "native_tool_name_invalid",
-        message: `The tool "${slug}" (from ${provider}) cannot be used with tools.dialect: native — a native function name may only contain letters, digits, underscores and hyphens, and must be 1-64 characters.`,
+        message: `The tool "${slug}" (from ${provider}) cannot be used with tools.dialect: native — a native function name may only contain letters, digits, underscores and hyphens (a dot is sent as \`__\`), and must be 1-64 characters.`,
         hint: `Either switch to the nlt dialect, which accepts this slug as written and is the default, or ask ${provider} for a slug within that grammar. It is refused rather than rewritten because a rewritten name is ambiguous on the way back — two different slugs can map onto one legal name.`,
         field: "tools.dialect",
     })
@@ -508,12 +568,13 @@ export function toolTimedOut(slug: string, ms: number): ToolError {
 export function toolFailed(slug: string, cause: unknown): ToolError {
     const message = cause instanceof Error ? cause.message : String(cause)
     return new ToolError({
-        code: cause instanceof HarnessError ? cause.code : "tool_failed",
+        // `isHarnessError`, not `instanceof`: a tool provider is a separate package and may carry its
+        // own copy of this class, and a typed error with a hint must not degrade to a generic one.
+        code: isHarnessError(cause) ? cause.code : "tool_failed",
         message: `The tool "${slug}" failed: ${message}`,
-        hint:
-            cause instanceof HarnessError
-                ? cause.hint
-                : "This is the tool's own failure, passed through. The observation the model sees carries this same text, so it can explain or retry with different arguments.",
+        hint: isHarnessError(cause)
+            ? cause.hint
+            : "This is the tool's own failure, passed through. The observation the model sees carries this same text, so it can explain or retry with different arguments.",
         cause,
     })
 }
@@ -670,6 +731,24 @@ export function workspaceBudgetExceeded(init: WorkspaceBudgetInit): ConfigError 
     })
 }
 
+/**
+ * A volatile file changed while the agent was running and the new version does not load.
+ *
+ * A warning rather than a failure, and the asymmetry with boot is deliberate. At boot a bad workspace
+ * refuses to start, because nothing is running yet and refusing is the loudest signal available. Mid-run
+ * the agent is answering people, and a person saving an over-budget `MEMORY.md` from a UI must not take
+ * it down — so it keeps the last version that loaded and says so. Nothing is truncated either way: the
+ * model sees one complete, valid version or the other, never half of the new one.
+ */
+export function workspaceReloadRefused(cause: string, causeHint: string): ConfigError {
+    return new ConfigError({
+        code: "workspace_reload_refused",
+        message: `A volatile workspace file changed but the new version does not load, so the agent keeps the previous one: ${cause}`,
+        hint: `${causeHint} The change takes effect on the next turn after the file loads again; until then, and at the next start, the agent will not use it — a start refuses this workspace outright.`,
+        field: "context.volatile",
+    })
+}
+
 export function workspaceTierMismatch(name: string, declared: string, listed: string): ConfigError {
     return new ConfigError({
         code: "workspace_tier_mismatch",
@@ -701,20 +780,29 @@ export function workspaceNotWritableTier(
     })
 }
 
+/** How many counted lines the message names. The rest are in `details`, for a terminal. */
+const RULE_LINES_IN_MESSAGE = 6
+
 export function workspaceRuleBudget(init: {
     counted: number
     allowed: number
     perRuleSuccess: number
     reliabilityTarget: number
+    /** `<file>: <line>`, in order. */
     lines: readonly string[]
 }): ConfigError {
+    // The lines go in the message too, because the wire carries `toDetail()` and that has no
+    // `details`: an embedder whose reload this refused saw a count and no way to find the lines.
+    const shown = init.lines.slice(0, RULE_LINES_IN_MESSAGE).map((line) => `"${line}"`)
+    const more = init.lines.length - shown.length
     return new ConfigError({
         code: "workspace_rule_budget",
         message:
             `The workspace states ${init.counted} rules; at perRuleSuccess ${init.perRuleSuccess} a ` +
             `reliabilityTarget of ${init.reliabilityTarget} permits ${init.allowed}. ` +
-            `Expected compliance with all ${init.counted}: ${(init.perRuleSuccess ** init.counted).toFixed(2)}.`,
-        hint: "Delete rules, or move the ones with real consequences into tool-boundary code where they are enforced rather than requested. Do not raise reliabilityTarget — that changes the number without changing the behaviour. Counted lines are listed below; the count is a heuristic, so context.rules.onExceed: warn is the escape if it has misread a line.",
+            `Expected compliance with all ${init.counted}: ${(init.perRuleSuccess ** init.counted).toFixed(2)}. ` +
+            `Counted: ${shown.join("; ")}${more > 0 ? `; and ${more} more` : ""}.`,
+        hint: "Delete rules, or move the ones with real consequences into tool-boundary code where they are enforced rather than requested. Do not raise reliabilityTarget — that changes the number without changing the behaviour. The message names the counted lines; the count is a heuristic, so context.rules.onExceed: warn is the escape if it has misread a line.",
         field: "context.rules",
         details: init.lines.map((line) => ({
             code: "workspace_rule_counted",
@@ -729,6 +817,40 @@ export function workspaceNotEditable(name: string, editable: string): ToolError 
         code: "workspace_not_editable",
         message: `${name} is declared editable: ${editable}, so it cannot be written to.`,
         hint: "Point the write at a volatile file whose frontmatter allows it (editable: append or replace), or change that file's frontmatter. Read-only identity is deliberate — it is the most effective known mitigation for persona drift, so this refuses rather than silently doing nothing.",
+    })
+}
+
+export function privateMemoryRefused(): ToolError {
+    return new ToolError({
+        code: "memory_private_refused",
+        message:
+            "This conversation cannot write to your private memory: it is a room or a stand-in, and private notes are for the person you work for.",
+        hint: "Nothing was saved. If it is worth keeping, say so in the reply and let the person you work for save it in their own conversation. A team note goes to the space through the space writer.",
+    })
+}
+
+export function memoryForgetRefused(): ToolError {
+    return new ToolError({
+        code: "memory_forget_refused",
+        message:
+            "This conversation cannot change your private memory: it is a room or a stand-in, and private notes are for the person you work for.",
+        hint: "Nothing was deleted. The person you work for can ask for it in their own conversation; a person's shared notes are deleted with DELETE /v1/memory/notes/:id.",
+    })
+}
+
+export function memoryForgetArguments(): ToolError {
+    return new ToolError({
+        code: "memory_forget_arguments",
+        message: "memory_forget needs either `query` or `ids`, not both and not neither.",
+        hint: "Call it with `query` first to see what matches, show the person, then call it again with the `ids` they confirm.",
+    })
+}
+
+export function memoryForgetUnavailable(): ToolError {
+    return new ToolError({
+        code: "memory_forget_unavailable",
+        message: "Memory cannot be changed from here: nothing runs turns in this context.",
+        hint: "memory_forget works inside a turn of a running agent.",
     })
 }
 
@@ -1071,7 +1193,7 @@ export function unknownModelRole(name: string, known: readonly string[]): Config
         message: `No model role named "${name}" is declared. Declared: ${known.join(", ")}.`,
         hint:
             suggestion === undefined
-                ? `Add a "${name}" entry under model: in the manifest, or point the schedule at one of the declared roles.`
+                ? `Add a "${name}" entry under model: in the manifest (a person can add one with PATCH /config path model.${name}), or name one of the declared roles.`
                 : `Did you mean ${suggestion}?`,
         field: "schedules.role",
     })
@@ -1253,5 +1375,40 @@ export function tokenBudgetExhausted(
         message: `Agent "${agentId}" has spent ${used} of its ${max} tokens in the last ${Math.round(windowMs / 1000)} s (limits.tokens).`,
         hint: `Nothing was run. The budget is rolling, so it frees up as older calls leave the window. Raise limits.tokens.max or shorten windowMs in the manifest to change it; GET /v1/agents/:id/usage shows what was spent.`,
         field: "limits.tokens",
+    })
+}
+
+// ─── Images sent with a message (pilot.5, #12) ──────────────────────────────────────────────
+
+export function imageRefused(
+    code: string,
+    message: string,
+    hint: string,
+    field = "images",
+): HarnessError {
+    return new HarnessError({ code, message, hint, field })
+}
+
+export function modelNoVision(model: string): HarnessError {
+    return new HarnessError({
+        code: "model_no_vision",
+        message: `${model} does not read images, so a message with one was not sent.`,
+        hint: "Use a model that does (Claude, Nova Lite or Pro, GPT-4o), or describe the image in text. If this model does take images, set model.main.capabilities.vision: true.",
+        field: "images",
+    })
+}
+
+/** A schedule's `tools.allow` names nothing this agent has (pilot.5, #15). Same rule as a phase. */
+export function scheduleToolUnknown(
+    scheduleId: string,
+    entries: readonly string[],
+    available: readonly string[],
+    field: string,
+): ConfigError {
+    return new ConfigError({
+        code: "schedule_tool_unknown",
+        message: `Schedule "${scheduleId}" allows ${entries.join(", ")}, which ${entries.length === 1 ? "names" : "name"} nothing this agent has.`,
+        hint: `A schedule can only narrow the agent's own tools: name a pinned or local slug, a tag: annotation, or *. Available: ${available.join(", ") || "none"}. Refused rather than ignored, because a run with fewer tools than its author wrote fails quietly turns later.`,
+        field,
     })
 }

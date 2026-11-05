@@ -1,51 +1,131 @@
 # Dispach
 
-An open-source, self-hosted agent runtime your product calls over HTTP.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![CI](https://github.com/moeen-mahmud/dispach/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/moeen-mahmud/dispach/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/dispach)](https://www.npmjs.com/package/dispach)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/moeen-mahmud/badge.svg)](https://hub.xerj.org/contributors/moeen-mahmud)
 
-Your backend calls one API and Dispach runs the agents: each has its own memory, tools, schedules,
-channels and approvals, on any OpenAI-compatible model (including small local ones), on
-infrastructure you control. Every turn is detached and reattachable, every write takes an
-idempotency key, and the wire contract is published as OpenAPI 3.1 and checked in CI. One process
-hosts many agents, and scoped keys fence each one off. TypeScript, shipped on Node, Apache-2.0.
+**The agent backend your product calls over HTTP.** Open source and self-hosted: one API for agents
+with memory, tools, schedules, channels and approvals, on any OpenAI-compatible model.
 
-**Where it is going: the multiplayer agent runtime.** 0.2.0 gives every user and every team in your
+```bash
+curl -fsSL https://github.com/moeen-mahmud/dispach/releases/latest/download/install.sh | sh
+#   or: npm i -g dispach (Node 24+) · brew install moeen-mahmud/tap/dispach
+dispach init          # name the agent, pick a model, paste a key
+dispach run milo      # talk to it in the terminal
+```
+
+![A fresh Linux machine with no Node: the curl installer, init, serve, /v1/ready, then a first message in the terminal UI](https://raw.githubusercontent.com/moeen-mahmud/dispach/HEAD/.github/assets/install.gif)
+
+![The terminal UI: told to give itself write access to the whole home directory, the agent tries, and the settings floor refuses](https://raw.githubusercontent.com/moeen-mahmud/dispach/HEAD/.github/assets/tui.gif)
+
+Told to widen its own write access to `~`, the agent makes the call and the runtime refuses it: an
+agent may grant itself abilities, never reach. That floor is measured in the research below.
+
+Or run it as a server: one `docker run`, and [Call it over HTTP](#call-it-over-http) creates an
+agent and streams its reply in three requests.
+
+```bash
+docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach \
+  -e DISPACH_API_TOKEN=pick-a-secret ghcr.io/moeen-mahmud/dispach:0.2.4
+```
+
+The named volume is where the store, every agent and every key live; without it a `docker rm` for
+an upgrade starts empty. `--init` is there because `exec` backgrounds children and a child whose
+parent is PID 1 has nothing to reap it.
+
+**Research:** [*What May an Agent Change About Itself? A Containment Floor for Self-Configuring Agent
+Runtimes*](https://arxiv.org/abs/2610.06274) (Hossain and Mahmud, 2026, preprint) measures the floor in
+Dispach's settings tool: with it in place, 0 of 167 protected writes were saved, though the models
+attempted one in 65 of those cases.
+
+Your backend calls one API and Dispach runs the agents, each with its own memory and settings, on
+infrastructure you control and on models as small as local ones. Every turn is detached and
+reattachable, every write takes an idempotency key, and the wire contract is published as OpenAPI 3.1
+and checked in CI. One process hosts many agents, and scoped keys fence each one off. TypeScript,
+shipped on Node, Apache-2.0.
+
+**Where it is going: the multiplayer agent runtime.** 0.2.x gives every user and every team in your
 product their own isolated runtime of agents. Those agents share rooms and memory with the people
-they work for, and stand in for them, openly, when they are away. That half is being built. Every
-other feature described in this README runs today.
+they work for, and stand in for them, openly, when they are away. That half ships in 0.2.x as
+**experimental**: on the HTTP API and the browser console (no TUI screens yet), and it may change within 0.2.x.
+Everything else described in this README is stable.
+
+**Docs:** [dispach.blivius.com/docs](https://dispach.blivius.com/docs) ·
+**New in <!-- fact:version -->0.2.4<!-- /fact -->:** [the changelog, with upgrade notes](CHANGELOG.md) ·
+**New since 0.2.0:** [what each release added](developer-docs/runtime/whats-new-since-0-2-0.md) ·
+**Limits:** [what is measured, and what it does not do](developer-docs/runtime/limits-and-evidence.md)
+
+**Contributing:** start with a [good first issue](https://github.com/moeen-mahmud/dispach/labels/good%20first%20issue)
+or the [larger pieces that need an owner](https://github.com/moeen-mahmud/dispach/labels/help%20wanted), and
+[Start here](https://github.com/moeen-mahmud/dispach/discussions/38) for how a change gets in. The
+[roadmap](https://github.com/moeen-mahmud/dispach/discussions/56) says what is planned and where Dispach is behind.
 
 > To dispatch is to send a thing on its way with the authority to see it done — to decide
 > what handles it, hand it over, and answer for the result.
 
 ## Call it over HTTP
 
-```bash
-git clone https://github.com/moeen-mahmud/dispach && cd dispach
-cp .env.example .env                    # set DISPACH_API_TOKEN; no model key needed to start
-docker compose up -d --build --wait
-export TOKEN=$(grep DISPACH_API_TOKEN .env | cut -d= -f2-)
+![Starting the server, creating an agent over HTTP, and streaming its reply](https://raw.githubusercontent.com/moeen-mahmud/dispach/HEAD/.github/assets/quickstart.gif)
 
-curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"answers":{"user":"you","name":"milo","apiKey":"sk-…"}}' localhost:7420/v1/agents
+```bash
+export TOKEN=pick-a-secret
+docker run -d --init -p 7420:7420 -v dispach-home:/home/dispach -e DISPACH_API_TOKEN=$TOKEN \
+  ghcr.io/moeen-mahmud/dispach:0.2.4
+
+curl -s -H "Authorization: Bearer $TOKEN" localhost:7420/v1/agents \
+  -d '{"answers":{"user":"you","name":"milo","apiKey":"sk-…"}}'
 # → 201 {"id":"milo",…,"adopted":["milo"]}: live now, no restart
 
-curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"text":"what can you do?"}' localhost:7420/v1/agents/milo/messages
-# → 202 {"turnId":"t_…","sessionKey":"api:default"}: the turn runs whether or not you stay
+T=$(curl -s -H "Authorization: Bearer $TOKEN" localhost:7420/v1/agents/milo/messages \
+  -d '{"text":"what can you do?","chunks":true}' | jq -r .turnId)
+# → the turn runs whether or not you stay
+
+curl -sN -H "Authorization: Bearer $TOKEN" "localhost:7420/v1/agents/milo/turns/$T/stream?chunks=true"
+# → server-sent events: the turn as it happens, then turn.end with the final text
 ```
 
-The defaults are OpenAI's. For another endpoint, add `"model"` and `"baseUrl"` to the answers;
-`GET /v1/provision` lists every question with its default and choices.
+The defaults are OpenAI's. For another endpoint, add `"model"` and `"baseUrl"` to the answers, as the
+recording above does with `deepseek-v4-flash`; `GET /v1/provision` lists every question with its
+default and choices. To run it from a checkout instead, [Hosting with Compose](#hosting-with-compose)
+has the `docker compose` version.
 
 **[`docs/09-API-GUIDE.md`](docs/09-API-GUIDE.md) is the walkthrough**: provisioning over the wire,
-streaming, reattaching after a dropped connection, approvals and keys. The reference is served at
-`http://localhost:7420/docs`, the contract is [`docs/04-SPEC-WIRE.md`](docs/04-SPEC-WIRE.md), and
+streaming, reattaching after a dropped connection, approvals and keys. The reference is [on the docs site](https://dispach.blivius.com/docs/reference) and served by
+every server at `/docs`, the contract is [`docs/04-SPEC-WIRE.md`](docs/04-SPEC-WIRE.md), and
 `dispach/client` is the typed client. The CLI and the full-screen terminal UI below are the same
 runtime from a terminal.
 
+## Benchmarks
+
+The same 25 multi-turn tool tasks, run 5 times each, through three agent harnesses on identical tools
+and pinned model providers, every harness in its own container. Graded on what the tools were left
+holding, never on the reply's wording. Tasks passed out of 125, and the OpenRouter bill for the 125 runs:
+
+<!-- benchmark:start -->
+| Model | Dispach | Hermes 0.19.0 | OpenClaw 2026.10.5 |
+| --- | --- | --- | --- |
+| Claude Opus 5.5 | 125/125 (100%) · $2.05 | 119/125 (95%) · $2.24 | 105/125 (84%) · $7.10 |
+| Claude Sonnet 5.5 | 125/125 (100%) · $0.80 | 120/125 (96%) · $1.76 | 105/125 (84%) · $4.21 |
+| Claude Haiku 5.5 | 124/125 (99%) · $0.06 | 120/125 (96%) · $0.07 | 102/125 (82%) · $0.21 |
+| GPT-6.1 Sol | 125/125 (100%) · $0.54 | 120/125 (96%) · $0.53 | 95/125 (76%) · $1.73 |
+| Gemini 4 Argon | 119/125 (95%) · $2.29 | 123/125 (98%) · $2.79 | 108/125 (86%) · $5.47 |
+| GLM 5.3 | 125/125 (100%) · $0.80 | 123/125 (98%) · $1.18 | 98/125 (78%) · $4.86 |
+| DeepSeek V4 Pro | 125/125 (100%) · $0.31 | 120/125 (96%) · $0.50 | 96/125 (77%) · $2.83 |
+| Kimi K3 | 115/125 (92%) · $2.24 | 115/125 (92%) · $2.36 | 98/125 (78%) · $10.27 |
+| Gemma 4 26B-A4B | 112/125 (90%) · $0.24 | 108/125 (86%) · $0.41 | 91/125 (73%) · $2.95 |
+| qwen3.5-9b | 104/125 (83%) · $0.18 | 112/125 (90%) · $0.42 | 60/125 (48%) · $0.78 |
+| gpt-oss-20b | 97/125 (78%) · $0.05 | 111/125 (89%) · $0.10 | 51/125 (41%) · $0.12 |
+<!-- benchmark:end -->
+
+One benchmark of our own design, each harness on its own documented defaults; with 125 runs an arm a
+gap of a few runs is noise. Hermes leads on Gemini 4 Argon and the two small open models, and the
+[benchmark README](evals/harness/README.md) says why, with every run and reply committed.
+
 ## Status
 
-**Pre-release, and it runs: 0.1.3**, from npm, Homebrew or the container image. Every install runs
-under Node. [`CHANGELOG.md`](CHANGELOG.md) has what landed in each release.
+**<!-- fact:version -->0.2.4<!-- /fact -->**, from npm, Homebrew, the container image or the standalone installer. Every install
+runs under Node. [`CHANGELOG.md`](CHANGELOG.md) has what landed in each release.
 
 Built and in use:
 
@@ -54,17 +134,25 @@ Built and in use:
   with two catalogues, and scheduling (cron, interval and one-shot, DST-correct).
 - **Serving and API:** the HTTP/SSE/WS server with detached turns, the typed client, scoped operator
   keys, approvals over the wire, and provisioning an agent over HTTP with no restart.
+- **Models:** any OpenAI-compatible endpoint, AWS Bedrock through a pluggable transport, fallback
+  models, vision input, and replayed signed thinking.
 - **Channels and tools:** Telegram and WhatsApp (the latter a bundled plugin, with a warning;
-  [see below](#whatsapp)), the plugin API with all four middleware wrap points, and system and web
-  tool providers under a policy engine.
+  [see below](#whatsapp)), the plugin API with all four middleware wrap points, system and web
+  tool providers under a policy engine, remote MCP servers, and subagents, routed by the harness or
+  started by the model with `delegate` to fan research out in parallel.
 - **Coordination and delivery:** supervisor delegation with typed handoffs, and an idempotent
   outbox.
-- **Front ends and hosting:** a browser UI on the same origin as the API, the TUI, launchd
-  services, and the Docker image with a compose front door.
+- **Front ends and hosting:** a browser console on the same origin as the API (per agent: <!-- fact:console:agent -->Chat, Models, Team, Tools, Schedules, Channels, Turns, Usage, Files, Settings<!-- /fact -->; for the server: <!-- fact:console:server -->Overview, People, Rooms, Actions, Memory, Usage, Webhooks, Backup, Keys, API<!-- /fact -->), the TUI, launchd
+  services, the Docker image with a compose front door, Kubernetes, and `GET /v1/backup` for the
+  whole sandbox.
 
-Not built: **MCP as a tool provider.** It is planned, not refused. Decision 4.7 keeps it as *one
-tool provider among several, never the substrate* (Composio is called directly for that reason),
-so a `tools-mcp` provider is something that could be written and has not been.
+**Experimental in 0.2.x**: rooms, stand-ins and team memory; the Slack, Microsoft Teams and A2A
+channels; and media (transcription, image generation, spoken replies). The first three and the
+channels have screens in the browser console since 0.2.2 (People, Rooms, Actions, Memory,
+add a channel); media is still API-only.
+
+**MCP is a tool provider, never the substrate** (decision 4.7): remote servers over Streamable HTTP,
+their tools pinned by name like any other provider's. Composio is still called directly.
 
 `docs/05-PLAN.md` has every 0.1.x phase with its acceptance criteria and what is ticked.
 
@@ -84,15 +172,20 @@ a workflow engine, a RAG pipeline, a vector database, or a model gateway.
 
 The ones that would otherwise look like mistakes:
 
-- **Natural-language tool calling is the default dialect**, not native function calling.
-  Published replication across 14 models: +14.9pp accuracy, 93% fewer critical errors, −25%
-  tokens; +24 to +43pp on small models specifically. `native` is an explicit opt-in.
+- **`init` writes native function calling where the model supports it, and natural-language tool
+  calling (NLT) otherwise.** On the multi-turn harness benchmark native tied or beat NLT on every
+  model; NLT fell to 50–68% on four, by announcing a call and not making it
+  ([`evals/harness`](evals/harness/)). NLT still wins a single-call test (37 fixtures, no tool
+  executed, [`evals/tools`](evals/tools/)), and a 14-model replication reports +14.9pp for it
+  ([arXiv 2607.03953](https://arxiv.org/abs/2607.03953)) that did not reproduce on multi-turn work here.
+  A manifest without a `dialect` line keeps NLT, as it always has.
 - **The tool dialect is config and never auto-detected.** Behaviour must not change silently
   when the model changes.
 - **Tools are pinned at load, not searched at runtime.** Search-then-execute is two-hop
   reasoning, which is where small models fail.
 - **Compaction is progressive and harness-driven** — five stages from 60% context pressure,
-  not one lossy summarise at 95%.
+  not one lossy summarise at 95%. A long conversation is checkpointed, so it stops paying for its
+  compaction on every turn, and can be compacted on demand.
 - **Memory is SQLite FTS5, not embeddings.** No model weights, no embedding service, no
   network in the memory path.
 - **Zero network I/O before readiness.** Channels connect after `runtime.ready` and report
@@ -110,7 +203,7 @@ Full rationale for every decision, including the negative ones, is in `docs/00-D
 
 ```bash
 npm i -g dispach          # the `dispach` command
-dispach --version         # 0.1.2
+dispach --version         # 0.2.4
 ```
 
 and in an application that talks to a running server:
@@ -124,10 +217,38 @@ import { createClient } from "dispach/client"
 import type { AnyEvent } from "dispach/wire"
 ```
 
-There is no `@dispach/*` scope, deliberately: the runtime is nine workspace packages and one name,
+There is no `@dispach/*` scope, deliberately: the runtime is sixteen workspace packages (and a separately licensed control plane) under one name,
 so there is one thing to install, one thing to version and one thing to trust. `dispach/client`
 pulls in no terminal UI — asserted by the package's own tests, because an HTTP client has no
 business paying the ~170-210 ms that importing Ink and React costs.
+
+### Or without Node
+
+```bash
+curl -fsSL https://github.com/moeen-mahmud/dispach/releases/latest/download/install.sh | sh
+```
+
+macOS and Linux (glibc), arm64 and x64. Each release attaches one archive per platform: an official
+Node 24, checked against nodejs.org's checksums, beside the same npm tarball the other installs use.
+It is not a single compiled file on purpose — Bun can compile one, and Bun cannot complete the
+WhatsApp handshake (see below), so what ships is Node. The script checks the archive against the
+release's `SHA256SUMS`, unpacks it into `~/.dispach/versions/<version>`, links
+`~/.dispach/bin/dispach`, and adds that directory to `PATH` in your shell's rc file, saying which.
+Nothing needs root. Run it again to upgrade.
+
+| Variable | Effect |
+| --- | --- |
+| `DISPACH_VERSION=0.2.4` | that release instead of the latest |
+| `DISPACH_NO_MODIFY_PATH=1` | change no rc file; it prints the line to add |
+| `DISPACH_INSTALL_DIR=<dir>` | install somewhere other than `~/.dispach` |
+
+An upgrade does not move a background server installed with `dispach daemon install`, because the
+service names the version directory it was started from; the script says so and keeps that
+version, and `dispach daemon install` moves it. To uninstall, delete `~/.dispach/bin` and
+`~/.dispach/versions` and the `PATH` line; your agents beside them in `~/.dispach` are left alone.
+
+**Windows:** run it inside WSL (`wsl --install`), or use the container. A native build needs the
+shell tool and the service manager ported; that is [open for contributions (#76)](https://github.com/moeen-mahmud/dispach/issues/76).
 
 ### Or with Homebrew
 
@@ -144,12 +265,14 @@ naming a formula in full is *itself* what Homebrew accepts as consent to load a 
 `brew install dispach` after a plain `brew tap moeen-mahmud/tap` is the same install and refuses
 until `brew trust moeen-mahmud/tap` is run, because a bare name carries no such consent.
 
-`brew services start dispach` then runs the always-on server; `brew info` prints the rest.
+`brew services start dispach` then runs the always-on server; `brew info` prints the rest. Use it or
+`init`'s background service, not both: pass `--daemon none` to `init`, or two hosts contend for the
+same agents.
 
 ### Or the container
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.1.3
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.4
 ```
 
 The [Docker](#docker) and [Compose](#hosting-with-compose) sections below have the run lines and
@@ -168,7 +291,7 @@ bun run build                       # builds every package the binary imports
 cd packages/cli && bun link         # puts `dispach` on your PATH
 cd ../..
 
-dispach --version                   # 0.1.2
+dispach --version                   # 0.2.4
 dispach --help
 ```
 
@@ -179,10 +302,10 @@ Four things that are not obvious:
   command picks it up; you never re-link. If `dispach: command not found`, `~/.bun/bin` is not on
   your `PATH` — Bun's installer adds it, and a shell opened before you installed Bun will not have it.
 - **`bun run build` builds every workspace package, and you need all of them.** The CLI imports
-  `tools-system`, `tools-web`, `tools-composio` and `channel-telegram` from their `dist`, so building
-  only `core` and `cli` leaves the binary running yesterday's provider code — and the symptom is the
+  every provider package — tools, channels, the Bedrock transport, media — from their `dist`
+  (`packages/cli/src/lib/providers.ts` is the list), so building only `core` and `cli` leaves the binary running yesterday's provider code — and the symptom is the
   worst kind: your change is correct, a test fails, and the stack trace points into a stale `dist`.
-- **Node 24+ must be on your `PATH`.** The built entry's shebang is `#!/usr/bin/env node`; Bun builds
+- **Node <!-- fact:node -->24<!-- /fact -->+ must be on your `PATH`.** The built entry's shebang is `#!/usr/bin/env node`; Bun builds
   it and Node runs it — the same runtime every install ships.
 - **`DISPACH_HOME` relocates the whole sandbox.** Point it at a temporary directory and every agent,
   the store and the logs go there instead of `~/.dispach` — which is how to try things out, and how
@@ -214,12 +337,23 @@ passed on the command line lands in shell history — so a scripted run
 it in.
 
 **`--preset` carries the endpoints worth not typing from memory** — OpenAI, Anthropic, DeepSeek,
-OpenRouter, Groq, NVIDIA NIM, and Ollama both local and hosted — and `custom` is a first-class
-answer for anything else. Any OpenAI-compatible `/chat/completions` endpoint works, because there is
-no provider branch in the transport: one POST, one body builder. What a preset actually buys is
-getting the base URL's *shape* right, which is the part that is easy to get wrong. It must end at
-the version segment; the runtime appends `/chat/completions` itself, so a URL copied from a
-provider's docs with the full path is refused.
+OpenRouter, Groq, NVIDIA NIM, Ollama both local and hosted, and AWS Bedrock — and `custom` is a
+first-class answer for anything else. Any OpenAI-compatible `/chat/completions` endpoint works,
+because there is no provider branch in the transport: one POST, one body builder. What a preset
+actually buys is getting the base URL's *shape* right, which is the part that is easy to get wrong.
+It must end at the version segment; the runtime appends `/chat/completions` itself, so a URL copied
+from a provider's docs with the full path is refused. Bedrock is the one preset that is not three
+strings: `--preset bedrock --region eu-west-1` writes `api: bedrock-converse` and `options.region`,
+no URL and no key variable, because credentials come from the AWS default chain (environment, a
+named profile, the container or instance role). The web console's Models page offers the same list.
+
+**You talk to an agent in one conversation, wherever you reach it.** `init` makes you the owner of
+the agents it creates and writes `sessions.scope: owner`, so what you said on Telegram this morning
+is in the web console's chat and the terminal's this afternoon, and each reply goes back to wherever
+you asked. "New conversation" starts afresh on all of them at once. Strangers on a channel keep their
+own conversations, and anything one of your agents saves about you is recalled by your others.
+`dispach owner adopt <agent>` does the same for an agent made before 0.2.2
+(`docs/23-SPEC-SESSIONS.md`).
 
 Local Ollama and Ollama Cloud are **two presets on purpose.** Local needs no key, and the absent
 `apiKeyEnv` is what makes the manifest omit the field and the provider send no `authorization`
@@ -336,8 +470,8 @@ dispach stop milo       # or just one
 
 It asks each process to stop rather than killing it, because the graceful path is the only one that
 reaps commands the agent left running in the background, and it *disables* each service as well as
-unloading it — a safety switch that came back at the next login would not be one. `daemon start`
-brings an agent back.
+unloading it — a safety switch that came back at the next login would not be one. `dispach start
+milo` switches an agent back on, and `daemon start` loads a stopped service again.
 
 A configuration error stops the service **once** rather than restarting it forever — the generated
 job restarts on a crash signal and on nothing else, so a missing token leaves a stopped service and
@@ -350,7 +484,7 @@ manifest — which `init` writes `0600` — and the plist carries only `HOME`, `
 variables.
 
 **Linux and containers.** On Linux `daemon install` writes a systemd **user** unit and prints the
-two commands that start it — it does not run them, because nothing in this project's test
+three commands that start it (`daemon-reload`, `enable --now`, `enable-linger`) — it does not run them, because nothing in this project's test
 environment can execute `systemctl`, and a unit nobody has started is how a "supported" platform
 turns out not to be. Mind `loginctl enable-linger`, or the unit stops with your last session. In a
 container, the image's own `serve` is the process and the container runtime supervises it — it
@@ -364,7 +498,7 @@ token.
 
 ```bash
 cp .env.example .env               # then DISPACH_API_TOKEN
-docker compose up -d --build --wait
+docker compose up -d --wait        # pulls ghcr.io/moeen-mahmud/dispach, DISPACH_VERSION pins a tag
 curl localhost:7420/v1/ready       # {"status":"ready","agents":0}
 docker compose logs server         # the claim link — open it once to get a browser key
 ```
@@ -393,13 +527,18 @@ fail because one of N agents is misconfigured.
 
 Then open `http://localhost:7420` and paste nothing: the claim link in the logs carries a one-time
 token the page exchanges for a key it keeps. From there the page creates agents, holds a streaming
-conversation with one, and — since 0.1.1 — changes its settings and schedules; the tool, channel and
-key panels remain reports. Reading the container's own output is what confers
+conversation with one, and changes its models, tools, schedules, channels, files and settings; it
+also shows usage and every turn, and manages people, rooms, the actions queue, shared memory,
+webhooks, backups and scoped keys. Reading the container's own output is what confers
 first ownership, which grants nothing new to anyone who could already run `docker compose logs`.
 
-**`--build` is not optional after the first run.** `image: dispach:local` names a tag, and compose
-builds only when that tag is *absent* — so a second `up` reuses whatever was built before, reports
-healthy, and serves it. Measured while writing this: a two-day-old image came up green and answered
+**A plain `up` pulls the published image once and never again.** `image:` names
+`ghcr.io/moeen-mahmud/dispach:${DISPACH_VERSION:-latest}` with `pull_policy: missing`, so a machine
+that pulled `latest` last month keeps serving it until `docker compose pull`; pin `DISPACH_VERSION`
+in `.env` to make an upgrade a visible edit. Working from a checkout, `up -d --build --wait` builds
+this tree under the same tag — and then **`--build` is not optional after the first run**, because
+compose builds only when the tag is *absent*, so a second `up` reuses whatever was built before,
+reports healthy, and serves it. Measured while writing this: a two-day-old image came up green and answered
 every request from a binary that predated two whole phases. The recorded stale-`dist` hazard with a
 container around it, and the same tell — everything works, nothing is current.
 
@@ -458,7 +597,7 @@ the shape.
 The container is the honest place to exercise an agent that has a shell, and not only for
 containment. Every `exec` test in this repo otherwise runs on macOS, where the shell is a real
 bash and `realpath` resolves `/var` through a symlink — the exact conditions the recorded
-`$PWD`-comparison bug lived in. In the image it is busybox `sh` on Linux, with a different PATH
+`$PWD`-comparison bug lived in. In the image it is Debian's `dash` as `/bin/sh` on Linux, with a different PATH
 and different `realpath` semantics. Those have never been exercised until now.
 
 ```bash
@@ -487,7 +626,7 @@ fenced as untrusted. What the agent's shell can reach is `sh`, `bash`, `git`, `p
 and `curl` — `git` because the skills catalogue is fetched with it and its absence *deletes* that
 feature rather than degrading it, `python3` and `uv` because a skill shipping scripts needs them.
 
-What is **absent on purpose**, and asserted as such: no Bun — the application is the published npm
+What is **absent on purpose** (CI asserts Bun and the editors are missing): no Bun — the application is the published npm
 package running under Node, exactly what a laptop runs; no `wget`, so there is one obvious HTTP client rather than two; and no pager
 and no editor, because `exec` hands a child a file descriptor and never a TTY — anything that pages
 or prompts blocks until its deadline and reads as a hung agent. The CI `docker` job asserts both
@@ -515,13 +654,14 @@ consequence: run it on a laptop and the policy is the only boundary there is.
 ## Docker
 
 ```bash
-docker pull ghcr.io/moeen-mahmud/dispach:0.1.3          # or build it: docker build -f docker/Dockerfile -t dispach .
-docker run --rm -p 7420:7420 \
+docker pull ghcr.io/moeen-mahmud/dispach:0.2.4          # or build it: docker build -f docker/Dockerfile -t dispach .
+cp examples/minimal/.env.example examples/minimal/.env  # then MODEL_API_KEY; only the example is tracked
+docker run --rm --init -p 7420:7420 \
   --env-file examples/minimal/.env \
   -e DISPACH_API_TOKEN=pick-something \
   -v "$PWD/examples/minimal:/agent" \
   -v dispach-home:/home/dispach \
-  ghcr.io/moeen-mahmud/dispach:0.1.3
+  ghcr.io/moeen-mahmud/dispach:0.2.4
 ```
 
 The token is not optional and is not boilerplate. The image binds `0.0.0.0`, because a process
@@ -550,8 +690,8 @@ deliberately. A Telegram outage must not read as an unhealthy container and get 
 the same outage, so the probe answers "can it serve a turn" rather than "is everything connected".
 Channel state lives on the agent resource instead.
 
-Measured on an arm64 Docker Desktop at 0.1.3: the image is **701 MB** against an 800 MB ceiling,
-and `docker compose up -d --wait` reaches healthy in about six seconds — readiness is tens of
+Measured on an arm64 Docker Desktop at 0.2.0: the image is **867 MB** (701 MB at 0.1.3; the static
+`ffmpeg` for voice notes is 104 MB of the difference), and `docker compose up -d --wait` reaches healthy in about six seconds — readiness is tens of
 milliseconds in-process and almost all of that is waiting for the first healthcheck probe. Where the
 size goes: 110 MB Debian, 160 MB of Node (with npm and corepack, kept so the agent's shell has a
 Node toolchain), 158 MB of apt packages (of which `git` alone is **92 MB**, because Debian's git
@@ -564,9 +704,9 @@ and a real streaming turn against DeepSeek reconstructs from 26 `model.chunk` fr
 about one afternoon.
 
 Two notes on reading those numbers. The size is `docker image inspect --format '{{.Size}}'`, which
-is what the CI gate uses; `docker images` prints **180 MB** for the same image on the same machine,
-a different accounting, so check which one a figure came from before treating it as a regression.
-And the boot happened with a **deliberately invalid** model key — no network I/O before
+is what CI reports on every push. Older Docker releases printed a much smaller figure under
+`docker images`, a different accounting, so check which one a figure came from before treating it as
+a regression. And the boot happened with a **deliberately invalid** model key — no network I/O before
 `runtime.ready` is the rule this project exists for, and a container reaching healthy on a fake
 credential is that rule visible from outside.
 
@@ -584,7 +724,7 @@ bun run bench:boot   # must stay under 1000 ms
 bun run bench:schedule  # 100 schedules on one timer — reports drift, does not assert it
 ```
 
-Requires Bun. Node 24+ is supported as a soft goal, tested in CI, never a merge blocker.
+Bun is the development toolchain: install, build and test. Everything shipped runs under Node <!-- fact:node -->24<!-- /fact -->+.
 
 A few house rules that bite first, all enforced by tests rather than review:
 
@@ -605,23 +745,26 @@ Public pull requests are welcome; [`CONTRIBUTING.md`](CONTRIBUTING.md) is the co
 
 ## Boot budget
 
-Process start → `runtime.ready` in under **1000 ms**, enforced in CI at 1200 ms.
+Process start → `runtime.ready` in under **1000 ms**, enforced in CI at 1200 ms. Every performance
+number in this README has a row in [`evals/CLAIMS.md`](evals/CLAIMS.md) naming the file it comes from.
 
-Measured at **~53 ms** — 37 ms of interpreter and imports, 16 ms inside `Runtime.create` — and
-checked on every phase rather than at the end:
+Measured at **~65 ms** at 0.2.0 — 45 ms of interpreter and imports, 21 ms inside `Runtime.create` —
+and checked on every phase rather than at the end (it was ~53 ms at 0.1.3; the 0.2.0 packages
+account for the difference):
 
 ```bash
 bun run bench:boot
 ```
 
 Reported with the machine state it was taken on, because without that a boot number is a number
-about somebody's afternoon: the figure above is a 7-run median on an M-series laptop at a load
-average of ~5, and the same tree measured 58 ms with four builds running beside it. The budget has
+about somebody's afternoon: the figure above is a 7-run median on an Apple M4 Pro at a load
+average of ~3.3, and an earlier run of the same tree at a load average of ~5 measured 91 ms. The budget has
 three orders of magnitude of headroom, so the reason to say this is not the arithmetic — it is that
 a regression is only visible against a figure you can reproduce.
 
-This single number is why the project exists: the runtime it replaces spends roughly four minutes on
-network calls during hook initialisation. Nothing here touches the network before readiness.
+This single number is why the project exists: the gateway it replaced blocked for minutes on
+network calls during hook initialisation, observed on our own deployment and not measured in
+[`evals/`](evals/). Nothing here touches the network before readiness.
 
 If you ever see a boot in the tens of seconds, check `uptime` before profiling. Twice it has been the
 machine being saturated — once by orphaned shells this runtime had itself failed to reap — and not the
@@ -718,6 +861,7 @@ hand-written, and was missing five commands at once. `dispach <command> --help` 
 | `sessions` | list stored sessions, or inspect one |
 | `memory` | search what the agent remembers, or rebuild the index from the files |
 | `config` | read and change an agent's settings, and fill in its secrets |
+| `owner` | show who owns this machine's agents, or make an existing agent yours |
 | `validate` | load and validate a manifest, then exit |
 | `workspace` | check the workspace files against the authoring rules |
 | `soul` | scaffold a hand-edited compact identity from a long-form document |
@@ -759,7 +903,8 @@ hand-written, and was missing five commands at once. `dispach <command> --help` 
 | `docs/12-OPENCLAW-CUTOVER.md` | Moving off the runtime this one replaces |
 | `RELEASING.md` | How a release is cut: the changelog, `bun run release`, and what the tag publishes |
 | `CHANGELOG.md` | What changed in each release, in bullets |
-| `developer-docs/` | Public GitBook source for integrators and contributors |
+| `developer-docs/` | Source of the public docs at `/docs`, for integrators and contributors |
+| `site/` | The landing page and docs site, built with Next.js and Fumadocs |
 | `CONTRIBUTING.md` | Public contribution policy and workflow entry point |
 | `CLAUDE.md` | The standing brief: hard rules and the hazards already paid for |
 | `evals/` | Every performance claim, with the number and a script to reproduce it |

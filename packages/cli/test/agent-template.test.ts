@@ -25,7 +25,12 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BRAND, type HarnessError, loadManifest } from "@dispach/core"
 import { secretStatus, writeSecrets } from "#lib/agent-secrets"
-import { listTemplates, provisionFromTemplate } from "#lib/agent-template"
+import {
+    listTemplates,
+    provisionFromTemplate,
+    rerenderFromTemplate,
+    templateRecordOf,
+} from "#lib/agent-template"
 import { provisionAgent } from "#lib/provision"
 
 const dirs: string[] = []
@@ -72,6 +77,52 @@ function codeOf(run: () => unknown): string {
     }
     return "(no error)"
 }
+
+describe("a template reading the server's environment", () => {
+    test("loads when the server sets the variable, and is refused naming it when nothing does", () => {
+        const box = sandbox()
+        const path = join(box.templates, "support", "agent.yaml")
+        writeFileSync(
+            path,
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: the manifest's own ${VAR} syntax
+            readFileSync(path, "utf8").replace(/baseUrl: .*/, "baseUrl: ${PROBE_BASE_URL}"),
+        )
+        const make = (name: string) => () =>
+            provisionFromTemplate({
+                templatesDir: box.templates,
+                agentDirBase: box.agents,
+                template: "support",
+                name,
+                vars: { store: "Acme" },
+            })
+        // Unset: stubbed, and the stub is not a URL, so the refusal names the field.
+        expect(codeOf(make("First"))).toBe("manifest_validation_failed")
+        process.env.PROBE_BASE_URL = "https://api.example.com/v1"
+        try {
+            expect(make("Second")().agentId).toBe("second")
+        } finally {
+            delete process.env.PROBE_BASE_URL
+        }
+    })
+})
+
+describe("templateRecordOf", () => {
+    test("reads the template and the plain vars, never the secret one", () => {
+        const box = sandbox()
+        const result = provisionFromTemplate({
+            templatesDir: box.templates,
+            agentDirBase: box.agents,
+            template: "support",
+            name: "Acme Store",
+            vars: { store: "Acme", apiKey: "sk-acme" },
+        })
+        expect(templateRecordOf(result.dir)).toEqual({
+            template: "support",
+            vars: { store: "Acme" },
+        })
+        expect(templateRecordOf(box.root)).toBeUndefined()
+    })
+})
 
 describe("provisionFromTemplate", () => {
     test("writes an agent that loads, under the derived id, with its secret at 0600", () => {
@@ -256,5 +307,97 @@ describe("secrets", () => {
         expect(secretStatus(agent.manifestPath).find((e) => e.name === "MODEL_API_KEY")?.set).toBe(
             true,
         )
+    })
+})
+
+describe("rerenderFromTemplate (pilot.5)", () => {
+    function made() {
+        const box = sandbox()
+        const memory = join(box.templates, "support", "workspace", "MEMORY.md")
+        writeFileSync(memory, `${readFileSync(memory, "utf8")}\nNotes for {{vars.store}}.\n`)
+        writeFileSync(
+            join(box.templates, "support", "workspace", "AGENTS.md"),
+            "Serve {{vars.store}}.\n",
+        )
+        const result = provisionFromTemplate({
+            templatesDir: box.templates,
+            agentDirBase: box.agents,
+            template: "support",
+            name: "Acme Store",
+            vars: { store: "Acme", apiKey: "sk-acme" },
+        })
+        return { box, dir: result.dir }
+    }
+
+    test("rewrites only untouched files, never memory, and remembers the new values", () => {
+        const { box, dir } = made()
+        // Somebody edited AGENTS.md since it was rendered.
+        writeFileSync(join(dir, "workspace", "AGENTS.md"), "Serve Acme, politely.\n")
+        const memoryBefore = readFileSync(join(dir, "workspace", "MEMORY.md"), "utf8")
+
+        const result = rerenderFromTemplate({
+            templatesDir: box.templates,
+            agentDir: dir,
+            vars: { store: "Acme Ltd" },
+        })
+        expect(result.rendered).toEqual(["workspace/USER.md"])
+        expect(readFileSync(join(dir, "workspace", "USER.md"), "utf8")).toBe(
+            "You work for Acme Ltd.\n",
+        )
+        expect(result.skipped).toContainEqual({ file: "workspace/AGENTS.md", reason: "edited" })
+        expect(result.skipped).toContainEqual({ file: "workspace/MEMORY.md", reason: "memory" })
+        expect(readFileSync(join(dir, "workspace", "AGENTS.md"), "utf8")).toBe(
+            "Serve Acme, politely.\n",
+        )
+        expect(readFileSync(join(dir, "workspace", "MEMORY.md"), "utf8")).toBe(memoryBefore)
+        // The record moved with it, so a second change applies to the file this one wrote.
+        const again = rerenderFromTemplate({
+            templatesDir: box.templates,
+            agentDir: dir,
+            vars: { store: "Acme Group" },
+        })
+        expect(again.rendered).toEqual(["workspace/USER.md"])
+        expect(loadManifest(join(dir, "agent.yaml")).manifest.id).toBe("acme-store")
+        // The record holds no secret.
+        expect(readFileSync(join(dir, ".template.json"), "utf8")).not.toContain("sk-acme")
+    })
+
+    test("undo puts every file and the record back", () => {
+        const { box, dir } = made()
+        const userBefore = readFileSync(join(dir, "workspace", "USER.md"), "utf8")
+        const recordBefore = readFileSync(join(dir, ".template.json"), "utf8")
+        const result = rerenderFromTemplate({
+            templatesDir: box.templates,
+            agentDir: dir,
+            vars: { store: "Elsewhere" },
+        })
+        result.undo()
+        expect(readFileSync(join(dir, "workspace", "USER.md"), "utf8")).toBe(userBefore)
+        expect(JSON.parse(readFileSync(join(dir, ".template.json"), "utf8"))).toEqual(
+            JSON.parse(recordBefore),
+        )
+    })
+
+    test("a secret var, and an agent with no record, are refused by name", () => {
+        const { box, dir } = made()
+        expect(
+            codeOf(() =>
+                rerenderFromTemplate({
+                    templatesDir: box.templates,
+                    agentDir: dir,
+                    vars: { apiKey: "x" },
+                }),
+            ),
+        ).toBe("template_var_secret")
+        rmSync(join(dir, ".template.json"))
+        expect(
+            codeOf(() =>
+                rerenderFromTemplate({
+                    templatesDir: box.templates,
+                    agentDir: dir,
+                    vars: { store: "x" },
+                }),
+            ),
+        ).toBe("agent_not_from_template")
     })
 })

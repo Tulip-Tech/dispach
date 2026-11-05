@@ -13,7 +13,8 @@
  * voice, so the `workspace` command keeps warning until a person writes real exchanges.
  */
 
-import { BRAND, whenNotToUseKey } from "@dispach/core"
+import { BRAND, matchCapabilities, whenNotToUseKey } from "@dispach/core"
+import type { MeasuredWindow } from "#lib/measure-window"
 import { fillTemplate, SKILL_TEMPLATE, WORKSPACE_TEMPLATES } from "#lib/templates"
 
 /**
@@ -27,6 +28,12 @@ export const INIT_LOCAL_TOOLS: readonly { readonly slug: string; readonly note: 
     {
         slug: "memory_write",
         note: "mutating: serialises, holds a reserved write slot, never retried",
+    },
+    {
+        slug: "memory_forget",
+        // Kept out of the generated `policy.allow` on purpose: a delete the person asked for happens in
+        // a clean turn, and one prompted by a page or a file the agent just read is refused.
+        note: "mutating: lists by query, deletes only the ids it listed",
     },
     {
         slug: "artifact_read",
@@ -43,114 +50,14 @@ export const INIT_LOCAL_TOOLS: readonly { readonly slug: string; readonly note: 
 /** Exported so the drift test can compare against core without re-deriving the mapping. */
 export const INIT_LOCAL_TOOL_SLUGS: readonly string[] = INIT_LOCAL_TOOLS.map((tool) => tool.slug)
 
-export type PresetId =
-    | "openai"
-    | "anthropic"
-    | "deepseek"
-    | "openrouter"
-    | "groq"
-    | "nvidia"
-    | "ollama"
-    | "ollama-cloud"
-    | "custom"
+export { PRESETS, type Preset, type PresetId, presetById } from "#lib/presets"
 
-export interface Preset {
-    readonly id: PresetId
-    readonly label: string
-    /** Empty for `custom`, which has no defaults to offer. */
-    readonly modelId: string
-    readonly baseUrl: string
-    /** Absent means the manifest omits `apiKeyEnv` entirely — a keyless local endpoint. */
-    readonly apiKeyEnv?: string
-}
+import { PRESETS, type PresetId, presetById } from "#lib/presets"
 
-/**
- * The same presets the examples' `.env.example` documents, plus the aggregators and Ollama.
- * `custom` exists so an unlisted endpoint is a first-class answer rather than a fight with the
- * nearest preset.
- *
- * **Every one of these is the same transport.** There is no provider branch in
- * `chat-completions.ts` — one POST, one body builder — so a preset is nothing but three strings,
- * and adding one is cheap precisely because it buys no special-casing. What a preset *is* for is
- * that a base URL has to end at the version segment (the runtime appends `/chat/completions`
- * itself, and a URL pasted from a provider's docs with the full path is refused three times over),
- * and that is the sort of thing nobody should have to get right from memory.
- *
- * **`ollama` and `ollama-cloud` are two rows on purpose.** Local Ollama needs no key, and the
- * absent `apiKeyEnv` is what makes the manifest omit the field and the provider send no
- * `authorization` header. Ollama Cloud needs one. With a single row, choosing `ollama` and then
- * editing the base URL to the hosted endpoint produced a **keyless manifest with no route to a
- * key** short of hand-editing `apiKeyEnv` back in — a dead end reached by the obvious move.
- */
-export const PRESETS: readonly Preset[] = [
-    {
-        id: "openai",
-        label: "OpenAI",
-        modelId: "gpt-5-6-sol",
-        baseUrl: "https://api.openai.com/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "anthropic",
-        label: "Anthropic (OpenAI-compatible endpoint)",
-        modelId: "claude-sonnet-5",
-        baseUrl: "https://api.anthropic.com/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "deepseek",
-        label: "DeepSeek",
-        modelId: "deepseek-v4-flash",
-        baseUrl: "https://api.deepseek.com/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "openrouter",
-        label: "OpenRouter (many providers, one key)",
-        modelId: "deepseek/deepseek-chat",
-        baseUrl: "https://openrouter.ai/api/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "groq",
-        label: "Groq",
-        modelId: "llama-3.3-70b-versatile",
-        baseUrl: "https://api.groq.com/openai/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "nvidia",
-        label: "NVIDIA NIM",
-        modelId: "meta/llama-3.3-70b-instruct",
-        baseUrl: "https://integrate.api.nvidia.com/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "ollama",
-        label: "Ollama (local, no key)",
-        modelId: "qwen3.5:9b",
-        baseUrl: "http://localhost:11434/v1",
-    },
-    {
-        // Two rows rather than one — see the block comment above. The hosted endpoint takes a key
-        // and the local one must not, and a single row made the second reachable only by hand.
-        id: "ollama-cloud",
-        label: "Ollama Cloud (hosted, needs a key)",
-        modelId: "gpt-oss:120b",
-        baseUrl: "https://ollama.com/v1",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-    {
-        id: "custom",
-        label: "any other OpenAI-compatible endpoint",
-        modelId: "",
-        baseUrl: "",
-        apiKeyEnv: "MODEL_API_KEY",
-    },
-] as const
-
-export function presetById(id: string): Preset | undefined {
-    return PRESETS.find((preset) => preset.id === id)
+/** A purpose as the manifest's `description`: one line, inside the schema's 200 characters. */
+export function oneLineDescription(purpose: string): string {
+    const line = purpose.replace(/\s+/g, " ").trim()
+    return line.length <= 200 ? line : `${line.slice(0, 199)}…`
 }
 
 export interface InitAnswers {
@@ -162,7 +69,10 @@ export interface InitAnswers {
     readonly purpose: string
     readonly preset: PresetId
     readonly model: string
+    /** Empty for a transport that addresses its endpoint another way (Bedrock). */
     readonly baseUrl: string
+    /** The AWS region, asked only for the `bedrock` preset; becomes `options.region`. */
+    readonly region?: string
     /**
      * The env var the manifest names. Absent = the manifest omits the field entirely (a keyless
      * endpoint). Set from `--api-key-env` or the preset, never asked: which *variable* holds the
@@ -759,6 +669,7 @@ export const STEP_ORDER: readonly InitStep[] = [
     "preset",
     "model",
     "baseUrl",
+    "region",
     "apiKey",
     "system",
     "web",
@@ -880,6 +791,9 @@ export function nextQuestion(
         if (step === "apiKey" && preset !== undefined && preset.apiKeyEnv === undefined) {
             continue
         }
+        // Bedrock has no URL and is asked for a region instead; every other transport the reverse.
+        if (step === "baseUrl" && preset?.api === "bedrock-converse") continue
+        if (step === "region" && preset?.api !== "bedrock-converse") continue
         // The backend and its key are only questions for someone who asked for search. Skipped
         // rather than asked-and-ignored: an answer the flow discards is a question that lies.
         if ((step === "webBackend" || step === "webKey") && partial.web !== "search") continue
@@ -936,6 +850,8 @@ export function nextQuestion(
                 return { step, prompt: "Model id", fallback: preset?.modelId ?? "" }
             case "baseUrl":
                 return { step, prompt: "Base URL", fallback: preset?.baseUrl ?? "" }
+            case "region":
+                return { step, prompt: "AWS region", fallback: preset?.region ?? "us-east-1" }
             case "apiKey":
                 return {
                     step,
@@ -1329,6 +1245,14 @@ export function validateAnswer(step: InitStep, raw: string): Answered {
                 : { ok: true, value: chosen.value }
         }
 
+        case "region":
+            return /^[a-z]{2}(-[a-z]+)+-\d$/.test(value)
+                ? { ok: true, value }
+                : {
+                      ok: false,
+                      reason: "is not an AWS region name, such as eu-west-1 or us-east-1.",
+                  }
+
         case "baseUrl": {
             let url: URL
             try {
@@ -1667,10 +1591,34 @@ export interface GeneratedFile {
  * it does and how* — responsibilities, workflow, the memory procedure, and eventually the
  * team routing. They coexist; what must not exist is a second *identity* document.
  */
-export function planFiles(answers: InitAnswers): readonly GeneratedFile[] {
+/**
+ * The generated dialect (decision 14.125): native where the capability registry says the model calls
+ * tools natively, NLT otherwise. Measured on fourteen models, native tied or beat NLT on thirteen and NLT
+ * fell to 37-62% on five, by announcing a call and not making it. Written as a literal, so an existing
+ * agent keeps the dialect it has and none changes when its model does.
+ */
+function dialectLines(model: string): readonly string[] {
+    return matchCapabilities(model).capabilities.nativeTools
+        ? [
+              `  # native: the model's own function calling. nlt (calls written as text) is the opt-in for`,
+              `  # a model without it; the harness benchmark in evals/harness/ has both, per model.`,
+              `  dialect: native`,
+          ]
+        : [
+              `  # nlt: calls written as text, because the capability registry does not know this model to`,
+              `  # call tools natively. If it does, \`dialect: native\` was ahead on 13 of 14 measured models.`,
+              `  dialect: nlt`,
+          ]
+}
+
+/**
+ * Every file `init` writes. `window` is the endpoint's published window when `init` could ask it
+ * (decision 14.124), passed beside the answers because every answer is also a flag and this is not.
+ */
+export function planFiles(answers: InitAnswers, window?: MeasuredWindow): readonly GeneratedFile[] {
     const substitutions = substitutionsFor(answers)
     return [
-        { relPath: "agent.yaml", contents: manifestFor(answers) },
+        { relPath: "agent.yaml", contents: manifestFor(answers, window) },
         ...(
             [
                 "SOUL.md",
@@ -1740,7 +1688,10 @@ function substitutionsFor(answers: InitAnswers): Record<string, string> {
     // warmly and saved nothing, and the recall the person then saw came from session
     // history — which evaporates on a fresh session. The tool catalogue's whenToUse alone
     // did not move a frontier model to save; the identity file is what sets behaviour.
-    const ruleConfirm = `I confirm before anything that sends, spends, schedules, or deletes, because I'm wired into live systems and mistakes there are expensive.`
+    // Conditional on the ask, because an unconditional "confirm before anything that sends" made an
+    // explicit "message Sam" end on a question: 11 to 21 of 125 runs per benchmark arm
+    // (evals/harness/runs/baseline-aae8fe4). Deleting still always confirms; it cannot be undone.
+    const ruleConfirm = `I confirm before I send, spend or schedule anything ${user} didn't ask for in so many words, and before I delete anything at all, because I'm wired into live systems and mistakes there are expensive.`
     const ruleHonesty = `When I don't know something I say so and offer to go find out, rather than producing something plausible and letting ${user} discover the difference later.`
     const ruleMemory = `When ${user} tells me something worth keeping — a fact about them, a preference, a decision — I save it with memory_write in the same turn, because the conversation is not memory and a new session starts without it.`
 
@@ -1812,8 +1763,10 @@ function substitutionsFor(answers: InitAnswers): Record<string, string> {
             `note and what ${user} just said disagree, the person wins and I correct the note.`,
 
         BOUNDARIES:
-            `If something involves a person other than ${user}, I ask what they want shared ` +
-            `before including it — ${user} knows the relationship and I don't.`,
+            // Conditional on what was asked, as the confirm rule became in 14.117: unconditional, it
+            // made Gemini 4 Argon ask what to share when told exactly what to send (7 of 10 chain runs).
+            `If something involves a person other than ${user} and ${user} hasn't said what to ` +
+            `share, I ask before including it — ${user} knows the relationship and I don't.`,
         UNCERTAINTY_BEHAVIOUR:
             `When I can't reach a tool or a request is ambiguous, I say which part is unclear ` +
             `and ask, because guessing just moves the cost somewhere ${user} can't see it.`,
@@ -1824,9 +1777,9 @@ function substitutionsFor(answers: InitAnswers): Record<string, string> {
 
 /**
  * The generated manifest, in the reference style: everything init configured is live, and
- * everything a later phase delivers is present but commented, labelled with its phase — so the
- * file teaches its own surface. A commented section is REFUSED AT LOAD if uncommented before its
- * phase ships; the runtime never silently ignores configuration.
+ * every optional subsystem the runtime knows is present but commented — so the file teaches
+ * its own surface. Uncommenting a section turns it on for real, and the runtime refuses
+ * configuration it does not recognise rather than silently ignoring it.
  *
  * Every mention of the binary interpolates `BRAND.slug` (hard rule 3), and the endpoint values
  * live in `.env` so switching providers never edits this file.
@@ -2081,7 +2034,7 @@ function hostZoneName(): string {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 }
 
-function manifestFor(answers: InitAnswers): string {
+function manifestFor(answers: InitAnswers, window: MeasuredWindow | undefined): string {
     const slug = slugify(answers.name)
 
     const lines = [
@@ -2094,6 +2047,12 @@ function manifestFor(answers: InitAnswers): string {
         `apiVersion: ${BRAND.apiVersion}`,
         `id: ${slug}`,
         `name: ${answers.name}`,
+        // The "what is it for" answer, so this person's other agents know when to ask this one
+        // (decision 15.9). Quoted, because a purpose is free text and a colon in it is YAML.
+        // Left out when empty: the schema refuses an empty description, and a blank is not one.
+        ...(oneLineDescription(answers.purpose) === ""
+            ? []
+            : [`description: ${JSON.stringify(oneLineDescription(answers.purpose))}`]),
         ``,
         rule("model"),
         `model:`,
@@ -2108,11 +2067,24 @@ function manifestFor(answers: InitAnswers): string {
         // \${VAR} still expands everywhere. It is simply not what a generated file should reach for
         // when the value is a fact about this agent.
         `    id: ${answers.model}`,
-        `    # Must end at the version segment; the runtime appends /chat/completions itself.`,
-        `    baseUrl: ${answers.baseUrl}`,
-        `    # Both take \${VAR} if you would rather set them from the environment — a container, say.`,
-        `    # The KEY never goes here in either form; the manifest names its variable, below.`,
     ]
+    if (answers.region !== undefined) {
+        lines.push(
+            `    # AWS Bedrock over the Converse API. No URL and no key variable: credentials come from`,
+            `    # the AWS default chain — environment, a named profile, the container or instance role.`,
+            `    api: bedrock-converse`,
+            `    options:`,
+            `      region: ${answers.region}`,
+            `      # profile: my-aws-profile`,
+        )
+    } else {
+        lines.push(
+            `    # Must end at the version segment; the runtime appends /chat/completions itself.`,
+            `    baseUrl: ${answers.baseUrl}`,
+            `    # Both take \${VAR} if you would rather set them from the environment — a container, say.`,
+            `    # The KEY never goes here in either form; the manifest names its variable, below.`,
+        )
+    }
     if (answers.apiKeyEnv !== undefined) {
         lines.push(
             `    # The *name* of an env var, never a value — a literal key fails validation.`,
@@ -2120,8 +2092,10 @@ function manifestFor(answers: InitAnswers): string {
         )
     }
     lines.push(
-        `    temperature: 0.3`,
-        `    # reasoningEffort: none   # none | minimal | low | medium | high — a reasoning model`,
+        // Commented, never live: GPT-6.x and the Claude 5.5 rows refuse a temperature, and an endpoint
+        // that enforces its parameters refuses the whole request — a fresh agent that cannot answer.
+        `    # temperature: 0.3        # some models refuse any temperature; leave unset for those`,
+        `    # reasoningEffort: none  # none | minimal | low | medium | high — a reasoning model`,
         `    #                         # bills its thinking to the output budget; verify per endpoint`,
         `    # topP: 0.95`,
         `    # maxTokens: 4096`,
@@ -2137,7 +2111,9 @@ function manifestFor(answers: InitAnswers): string {
         `  # A cheap model for tool selection and summarisation. \`$ref\` reuses a role.`,
         `  # selector:`,
         `  #   id: a-cheaper-model`,
-        `  #   baseUrl: ${answers.baseUrl}`,
+        ...(answers.region === undefined
+            ? [`  #   baseUrl: ${answers.baseUrl}`]
+            : [`  #   api: bedrock-converse`, `  #   options: { region: ${answers.region} }`]),
         `  # compactor: { $ref: model.selector }`,
         ``,
         rule("context"),
@@ -2163,6 +2139,15 @@ function manifestFor(answers: InitAnswers): string {
         `  # This is NOT a cap on what the model may generate — nothing is sent as max_tokens unless`,
         `  # you set model.main.maxTokens. Generous because a reasoning model thinks here too.`,
         `  reserveOutput: 8192`,
+        ...(window === undefined
+            ? []
+            : [
+                  ``,
+                  `  # The window the endpoint published for ${answers.model} when this file was made, from`,
+                  `  # ${window.source}. A fact about the endpoint, not the model: change it if the`,
+                  `  # model is served somewhere else.`,
+                  `  window: ${window.tokens}`,
+              ]),
         ``,
         `  # Capability-gated identity: SOUL.md ships only to a model meeting \`requires\`; anything`,
         `  # else gets the hand-edited compact file. Edit SOUL.md first, then re-derive`,
@@ -2175,7 +2160,7 @@ function manifestFor(answers: InitAnswers): string {
         ``,
         `  # Defaults shown; uncomment to change. Budgets fail the load naming the file — never`,
         `  # silent truncation.`,
-        `  # observationMaxTokens: 2000`,
+        `  # observationMaxTokens: 2000   # not a default: absent means 5% of the window, 2,000 to 32,000`,
         `  # budgets: { static: 2000, volatile: 3500, reminder: 500, total: 6000 }`,
         `  # rules:`,
         `  #   perRuleSuccess: 0.90    # measure with \`bun run eval:rules\` in a checkout, do not guess`,
@@ -2185,7 +2170,7 @@ function manifestFor(answers: InitAnswers): string {
         rule("tools"),
         `tools:`,
         `  # Config only, never auto-detected: behaviour must not drift when the model changes.`,
-        `  dialect: nlt`,
+        ...dialectLines(answers.model),
         ``,
         `  # Built-in tools, resolved from memory. Never sent to a remote provider.`,
         `  local:`,
@@ -2266,6 +2251,25 @@ function manifestFor(answers: InitAnswers): string {
         `  includeHistory: true   # index clean prose, not only what was deliberately saved.`,
         `  #                      # Tool output and replies derived from it are never indexed: text a`,
         `  #                      # stranger wrote must not outlive the write gate`,
+        `  shared: true           # a saved note is also recalled by your other agents (agents:<you>).`,
+        `  #                      # A stand-in or a room never reads it`,
+        ``,
+        // Written live, because `init` makes the person this agent's owner: one conversation with
+        // them across the web, the terminal and every channel is what they would expect, and the
+        // per-surface default is what an embedder choosing its own keys needs (decision 15.6).
+        `# Sessions — how a conversation is chosen. owner: your turns from the web, the terminal and`,
+        `# every channel share one, and a stranger keeps their own. channel-peer: one per surface.`,
+        `# "New conversation" in the web or the terminal starts afresh everywhere at once.`,
+        `sessions:`,
+        `  scope: owner`,
+        ``,
+        // On, for the reason `sessions.scope` is: `init` makes the person this agent's owner, and
+        // their agents asking each other is what they would expect. The schema default stays off so
+        // an embedder's agents change nothing on upgrade (decision 15.15).
+        `# Delegation — ask: your other agents can ask this one a question (ask_agent), and it can`,
+        `# ask them. Both have to say yes. Off is "keep me out of it".`,
+        `delegation:`,
+        `  ask: true`,
         ``,
         // Named and switched on for the reason skills above is: `knowledge.dir` naming a path that
         // does not exist is a load failure, so the directory is scaffolded and an empty one is a
@@ -2351,7 +2355,10 @@ function envFor(answers: InitAnswers): string {
     // exactly what someone does by hand at this point.
     if (answers.serverToken !== undefined && answers.serverToken !== "") {
         lines.push("")
-        lines.push(`# The HTTP API's bearer token. Generated — replace it whenever you like.`)
+        lines.push(
+            `# The HTTP API's bearer token. Generated. In the sandbox every agent shares the host's,`,
+        )
+        lines.push(`# kept in agents/.api-token — change it there and restart the server.`)
         lines.push(`${BRAND.envPrefix}API_TOKEN=${answers.serverToken}`)
     }
     return `${lines.join("\n")}\n`

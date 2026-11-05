@@ -270,11 +270,15 @@ describe("events the transcript does not own", () => {
                     promptTokens: 10,
                     cached: false,
                     attempt: 1,
+                    callId: "mc_fixture",
                 }),
             },
             {
                 kind: "event",
                 event: ev("model.result", {
+                    callId: "mc_fixture",
+                    model: "m",
+                    role: "main",
                     outputTokens: 5,
                     promptTokens: 10,
                     promptTokensReported: true,
@@ -394,6 +398,25 @@ describe("tool rows", () => {
         expect(state.items[0]?.role).toBe("note")
         expect(state.items[0]?.text).toContain("memory_write")
         expect(state.items[0]?.text).toContain("asking the model again")
+    })
+
+    test("a nudge is a note saying the reply stopped short, not a tool that failed", () => {
+        // 14.123's nudge carries no slugs. Rendered as a repair it read "— could not be used", a failure
+        // with no tool in it, next to a call that had just succeeded.
+        const state = run([
+            START,
+            {
+                kind: "event",
+                event: ev("tool.repair", {
+                    slugs: [],
+                    errors: ["said it would act and made no call"],
+                }),
+            },
+        ])
+        expect(state.items[0]?.role).toBe("note")
+        expect(state.items[0]?.text).toBe(
+            "reply stopped short (said it would act and made no call), asking the model to finish",
+        )
     })
 
     test("a blocked write is a visible note naming the policy that decided", () => {
@@ -701,6 +724,9 @@ describe("a multi-step turn reads in the order it happened", () => {
         return {
             kind: "event",
             event: ev("model.result", {
+                callId: "mc_fixture",
+                model: "m",
+                role: "main",
                 outputTokens: 10,
                 promptTokens: 100,
                 promptTokensReported: true,

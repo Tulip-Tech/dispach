@@ -2,14 +2,25 @@
 
 The shipped container runs the published Node 24 package as a non-root user. The process needs persistent storage for agents, stores, keys, and logs.
 
+To run outside a container, install through npm, Homebrew, or the install script: see [Install and serve](../quickstart/install-and-serve.md).
+
 ## Health checks
 
 Use `/v1/ready` for traffic readiness. Local startup completes before channels and remote catalogues connect; inspect status and events for those integrations separately.
+
+On a host install, where `serve` runs under the service manager:
 
 ```bash
 curl --fail http://localhost:7420/v1/ready
 dispach status
 dispach daemon logs
+```
+
+In the container, `serve` is the foreground process and writes to the container's output, so read it there; the image's health check already polls `/v1/ready`:
+
+```bash
+curl --fail http://localhost:7420/v1/ready
+docker compose logs server      # or: docker logs <container>
 ```
 
 Do not expose a non-loopback server without `DISPACH_API_TOKEN`. Issue scoped keys to applications that should reach only one agent.

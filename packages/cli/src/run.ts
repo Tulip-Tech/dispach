@@ -15,6 +15,7 @@
 
 import { randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
+import { resolve } from "node:path"
 import { createInterface, type Interface } from "node:readline"
 import { createClient } from "@dispach/client"
 import {
@@ -27,6 +28,8 @@ import {
     endedBadly,
     endNote,
     HarnessError,
+    isChildSession,
+    isHead,
     processAlive,
     Runtime as RuntimeClass,
     VERSION,
@@ -57,7 +60,14 @@ import { agentIdFor, hostToken, liveHostOf } from "#lib/lifecycle"
 import { ENABLE_MOUSE } from "#lib/mouse"
 import { resolveModeFromProcess } from "#lib/output"
 import { offeredCommands } from "#lib/palette"
-import { BUILT_IN_PLUGINS, CHANNELS, scriptRunner, TOOL_PROVIDERS } from "#lib/providers"
+import {
+    BUILT_IN_PLUGINS,
+    CHANNELS,
+    MEDIA_PROVIDERS,
+    MODEL_TRANSPORTS,
+    scriptRunner,
+    TOOL_PROVIDERS,
+} from "#lib/providers"
 import { keyValue } from "#lib/render"
 import { priorMessages, reopenNote, resumeNotice } from "#lib/resume"
 import { listAgents, pluginRoot, storePath } from "#lib/sandbox"
@@ -197,7 +207,14 @@ export async function runCommand(options: RunOptions): Promise<number> {
     // the sandbox root: one store for every agent, wherever `run` is invoked from — a cwd-relative
     // default gave the same agent a different session history in every directory.
     const legacy = defaultStorePath()
-    if (options.store === undefined && options.ephemeral !== true && existsSync(legacy)) {
+    // Only when the old default is a different file: run from the home directory (the container's
+    // cwd) both are the sandbox store, and the note told people to pass the path they were using.
+    if (
+        options.store === undefined &&
+        options.ephemeral !== true &&
+        resolve(legacy) !== resolve(storePath()) &&
+        existsSync(legacy)
+    ) {
         process.stdout.write(
             `note: a session store exists at ${legacy} from an earlier version — pass --store ${legacy} to keep using it; the default is now ${storePath()}\n`,
         )
@@ -289,6 +306,8 @@ export async function runCommand(options: RunOptions): Promise<number> {
         const runtime = await RuntimeClass.create({
             agents: [options.manifestPath],
             toolProviders: TOOL_PROVIDERS,
+            modelTransports: MODEL_TRANSPORTS,
+            mediaProviders: MEDIA_PROVIDERS,
             builtInPlugins: BUILT_IN_PLUGINS,
             pluginRoot: pluginRoot(),
             scriptRunner: scriptRunner(),
@@ -311,7 +330,10 @@ export async function runCommand(options: RunOptions): Promise<number> {
         // `/restart` rebuilds the agent and stays in the same conversation.
         if (session.current === undefined || session.current === "") {
             const resolved = await resolveSession({
-                list: () => source.sessions(),
+                // The store, not `source`: that is built below, once the session is known, and
+                // reaching for it here threw `Cannot access 'source' before initialization` on every
+                // `--continue` and bare `--session` with no host running (since 3f7fe85).
+                list: async () => withoutChildren(await agent.store.sessions.list(agent.id)),
                 mode,
                 asked: session.current,
                 wantsContinue: options.continueSession === true,
@@ -323,7 +345,20 @@ export async function runCommand(options: RunOptions): Promise<number> {
             }
             session.current = resolved.sessionKey
             freshSession.current = resolved.fresh
+            // A run that asked for no conversation opens the person's own, where the agent keeps one
+            // across surfaces — the point of `sessions.scope: owner` is that the terminal shows it.
+            if (resolved.fresh)
+                session.current = (await ownConversationOf(agent)) ?? resolved.sessionKey
         }
+        // `/new` under an owner or peer scope moves every surface to a fresh conversation, which a
+        // `local:` key of the terminal's own could not do: the agent would resolve it straight back.
+        if (reopened === "new") {
+            const rotated = await agent.rotateSession({ source: "repl" })
+            if (rotated !== undefined) session.current = rotated.sessionKey
+        }
+        // The key the turns will actually run in. Under `sessions.scope: owner` a named `--session`
+        // lands in the owner's conversation, and every renderer follows events by key.
+        session.current = await agent.resolveSessionKey(session.current ?? "", { source: "repl" })
         const sessionKey = session.current
 
         // Reasoning is shown by default on a model that has any.
@@ -369,10 +404,19 @@ export async function runCommand(options: RunOptions): Promise<number> {
             send: (text, sendOptions) => agent.send(text, sendOptions),
             history: async (key) =>
                 priorMessages(await agent.history(key), agent.describe().dialect),
-            sessions: async () => await agent.store.sessions.list(agent.id),
+            sessions: async () => {
+                const heads = await agent.store.sessions.heads(agent.id)
+                return (await agent.store.sessions.list(agent.id)).map((session) => ({
+                    ...session,
+                    head: isHead(session.sessionKey, heads),
+                }))
+            },
             clearSession: async (key) => {
                 await agent.clearSession(key)
             },
+            ownConversation: () => ownConversationOf(agent),
+            resolveSessionKey: (key) => agent.resolveSessionKey(key, { source: "repl" }),
+            rotateSession: async () => (await agent.rotateSession({ source: "repl" }))?.sessionKey,
             context: async (key) => contextViewOf(agent, key),
             streamFilter: () => agent.streamFilter(),
             description: {
@@ -575,6 +619,17 @@ export interface ResolvedSession {
     readonly fresh: boolean
 }
 
+/**
+ * The conversation a terminal with no key should open: the person's own when `sessions.scope` keeps
+ * one (`docs/23-SPEC-SESSIONS.md`). Asked of the agent with a throwaway key, since resolving is
+ * exactly the question "where would a turn from the terminal land" — and the terminal is the operator.
+ */
+async function ownConversationOf(agent: Agent): Promise<string | undefined> {
+    const probe = "local:-"
+    const resolved = await agent.resolveSessionKey(probe, { source: "repl" })
+    return resolved === probe ? undefined : resolved
+}
+
 async function resolveSession(input: {
     /**
      * How to list conversations — not an `Agent`.
@@ -670,13 +725,9 @@ async function pickSession(sessions: readonly SourceSession[]): Promise<string |
     markTerminalDirty()
     const instance = render(
         createElement(SessionPicker, {
-            sessions: sessions.map((row) => ({
-                sessionKey: row.sessionKey,
-                messages: row.messages,
-                turns: row.turns,
-                lastActivityAt: row.lastActivityAt,
-                phase: row.phase,
-            })),
+            // The rows themselves, never a copy: a field-by-field literal dropped `head`, so a
+            // conversation `/new` left behind read "You" beside the current one.
+            sessions,
             now: Date.now(),
             columns: screenColumns(process.stdout.columns, FALLBACK_COLUMNS),
             maxRows: SESSION_PICKER_ROWS,
@@ -763,6 +814,17 @@ async function runAttached(
     })
 
     const described = await client.agent(agentId).describe()
+    // A stopped agent's resource answers with `status: "disabled"` since pilot.5 rather than 404. Only
+    // reachable in a race (the lease was read, then the agent was stopped), since a stop releases the
+    // lease and `run` attaches only to a holder. Refused here rather than attaching to an agent that
+    // will 404 every send.
+    if (described.status === "disabled") {
+        throw new HarnessError({
+            code: "agent_disabled",
+            message: `${agentId} was stopped while this run was attaching.`,
+            hint: `Start it with \`${BRAND.slug} start ${agentId}\`, then run again.`,
+        })
+    }
     const source = remoteSource({
         client,
         agentId,
@@ -795,7 +857,7 @@ async function runAttached(
     for (;;) {
         if (input.session.current === undefined || input.session.current === "") {
             const resolved = await resolveSession({
-                list: () => source.sessions(),
+                list: () => conversations(source),
                 mode: input.mode,
                 asked: input.session.current,
                 wantsContinue: input.continueSession === true,
@@ -804,7 +866,18 @@ async function runAttached(
             if (typeof resolved === "number") return resolved
             input.session.current = resolved.sessionKey
             freshSession.current = resolved.fresh
+            if (resolved.fresh) {
+                input.session.current = (await source.ownConversation()) ?? resolved.sessionKey
+            }
         }
+        if (reopened === "new") {
+            const rotated = await source.rotateSession()
+            if (rotated !== undefined) input.session.current = rotated
+        }
+        // Asked of the host, by the rule its `POST /messages` applies: the key the CLI named and the
+        // key its turns run in differ under `sessions.scope: owner`, and following the wrong one is a
+        // run that prints no reply.
+        input.session.current = await source.resolveSessionKey(input.session.current ?? "")
         const sessionKey = input.session.current ?? ""
 
         const banner =
@@ -975,14 +1048,7 @@ async function runRich(wired: Wired): Promise<RunOutcome> {
                 // rather than whatever a local store happens to hold. That is the whole reason an
                 // attached run opens no database: two readings of "which conversations exist" can
                 // disagree while both look correct, and only one of them is being written to.
-                const stored = await wired.source.sessions()
-                return [...stored].sort(byRecency).map((row) => ({
-                    sessionKey: row.sessionKey,
-                    messages: row.messages,
-                    turns: row.turns,
-                    lastActivityAt: row.lastActivityAt,
-                    phase: row.phase,
-                }))
+                return [...(await conversations(wired.source))].sort(byRecency)
             },
             onRestart: (draft: string) => {
                 restart = true
@@ -1100,6 +1166,10 @@ async function runPlain(wired: Wired): Promise<RunOutcome> {
      * had to remember to ask.
      */
     const unsubscribe = wired.source.subscribe((event: AnyEvent) => {
+        // This conversation's events only, as the rich path filters: a channel turn for another peer
+        // shares the bus, and so does a subagent, whose own streamed text would otherwise print into
+        // this reply. An event with no session key is runtime-wide.
+        if (event.sessionKey !== undefined && event.sessionKey !== sessionKey) return
         switch (event.type) {
             case "model.result":
                 show(filter.endStep())
@@ -1151,7 +1221,11 @@ async function runPlain(wired: Wired): Promise<RunOutcome> {
             case "tool.repair":
                 // Worth a line of its own: a silent repair looks like a slow turn.
                 if (showRows)
-                    row(`  · ${event.data.slugs.join(", ")} — could not be used, asking again`)
+                    row(
+                        event.data.slugs.length === 0
+                            ? `  · reply stopped short (${event.data.errors.join("; ")}), asking again`
+                            : `  · ${event.data.slugs.join(", ")} — could not be used, asking again`,
+                    )
                 return
 
             // Deliberately NOT gated on `showRows`. Every other row here is for a person watching,
@@ -1489,6 +1563,17 @@ async function sessionStatus(embedded: {
  * what is printed — with the pid and address, because "somewhere else" is not an answer somebody
  * can act on.
  */
+/** The sessions a person had, without the ones a delegation created (`isChildSession`). */
+function withoutChildren<T extends { readonly sessionKey: string }>(
+    rows: readonly T[],
+): readonly T[] {
+    return rows.filter((row) => !isChildSession(row.sessionKey))
+}
+
+async function conversations(source: AgentSource): Promise<readonly SourceSession[]> {
+    return withoutChildren(await source.sessions())
+}
+
 async function attachedStatus(source: AgentSource): Promise<string> {
     const described = source.describe()
     const host = source.host

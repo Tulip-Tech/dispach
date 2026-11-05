@@ -29,6 +29,8 @@ export type {
     ChannelLimits,
     ChannelStatus,
     ChannelTransport,
+    InboundAudio,
+    InboundImage,
     InboundMessage,
     IssuedChannelInput,
     OutboundMessage,
@@ -99,7 +101,9 @@ export {
     phasesFor,
 } from "./loop/phases.ts"
 export {
+    type ActingParticipant,
     frameSenderInput,
+    participantOf,
     SENDER_KINDS,
     type SenderKind,
     senderLabel,
@@ -117,7 +121,9 @@ export {
 export { type EndContext, endedBadly, endNote } from "./loop/turn-end.ts"
 export {
     editManifest,
+    editManifestChanges,
     editManifestSync,
+    type ManifestChange,
     type ManifestEdit,
     type ManifestEditResult,
     manifestDocument,
@@ -167,6 +173,8 @@ export type {
     PhaseConfig,
     ScheduleConfig,
     ServerConfig,
+    SessionScope,
+    SessionsConfig,
     SkillsConfig,
     TeamConfig,
     TeamMemberConfig,
@@ -176,12 +184,15 @@ export type {
 export {
     AgentManifestSchema,
     customRoleNames,
+    DEFAULT_MODEL_API,
     isReservedRole,
     MODEL_ROLES,
+    SESSION_SCOPES,
 } from "./manifest/schema.ts"
 export {
     AGENT_SETTABLE_PATHS,
     PERSON_SETTABLE_PATHS,
+    personSetting,
     SETTINGS,
     type Setting,
     settingByPath,
@@ -198,12 +209,54 @@ export {
 } from "./manifest/template.ts"
 export {
     assertApiVersion,
+    fallbackWarnings,
     scanForLiteralSecrets,
     scheduleDeliveryWarnings,
     type ValidateOptions,
     validateManifest,
 } from "./manifest/validate.ts"
 export { setInSource, uncommentInSource } from "./manifest/yaml-edit.ts"
+export {
+    IMAGE_TOKENS,
+    type ImageSpec,
+    imageFromBytes,
+    imageReference,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_MESSAGE,
+    readImages,
+    sniffImage,
+} from "./media/image-input.ts"
+export {
+    IMAGE_GENERATE,
+    imageGenerateTool,
+    MEDIA_DIR,
+    type MediaUsage,
+} from "./media/image-tool.ts"
+export {
+    type AudioInput,
+    audioExtension,
+    BUILT_IN_MEDIA_PROVIDERS,
+    type GeneratedImage,
+    type ImageRequest,
+    MediaError,
+    type MediaProvider,
+    type MediaProviderContext,
+    type MediaProviderFactory,
+    mediaProviderFor,
+    OPENAI_MEDIA_PROVIDER,
+    type ResolvedMedia,
+    resolveMedia,
+    type Transcript,
+    withDeadline,
+} from "./media/provider.ts"
+export {
+    describeScope,
+    parseScope,
+    type ReadPlan,
+    readPlan,
+    type SharedScope,
+    scopeCorpus,
+} from "./memory/scopes.ts"
 export {
     CAPABILITY_REGISTRY,
     type CapabilityEntry,
@@ -243,6 +296,7 @@ export type {
     ChatMessage,
     ChatRequest,
     FetchLike,
+    ImageInput,
     ModelProvider,
     ToolCallRequest,
     ToolDefinition,
@@ -257,6 +311,12 @@ export {
     windowReport,
 } from "./model/roles.ts"
 export { parseSSE, type SSEEvent } from "./model/sse.ts"
+export {
+    BUILT_IN_TRANSPORTS,
+    CHAT_COMPLETIONS_TRANSPORT,
+    type ModelTransport,
+    type ModelTransportContext,
+} from "./model/transport.ts"
 export { nearest } from "./nearest.ts"
 export {
     type AddressKind,
@@ -288,6 +348,7 @@ export {
     type LoadedPlugins,
     type LoadPluginsOptions,
     loadPlugins,
+    type MountedRoute,
     SETUP_BUDGET_MS,
 } from "./plugins/loader.ts"
 export {
@@ -304,8 +365,11 @@ export type {
     Logger,
     Permission,
     Plugin,
+    PluginCaller,
     PluginContext,
     PluginPaths,
+    PluginRoute,
+    PluginRouteRequest,
 } from "./plugins/plugin.ts"
 export { satisfies as satisfiesApiRange } from "./plugins/semver.ts"
 export {
@@ -318,11 +382,31 @@ export {
     type TurnAdmission,
 } from "./runtime/agent.ts"
 export {
+    type AgentBundle,
+    BUNDLE_SECTIONS,
+    BUNDLE_VERSION,
+    type BundleFile,
+    type BundleSection,
+    bundleSections,
+    exportBundle,
+    type ImportReport,
+    importBundle,
+} from "./runtime/bundle.ts"
+export {
     type ChannelFactory,
     type ChannelFactoryContext,
     ChannelHub,
     type ChannelHubOptions,
 } from "./runtime/channels.ts"
+export {
+    AGENT_PARTICIPANT,
+    agentOf,
+    agentParticipant,
+    ConversationHub,
+    type ConversationHubOptions,
+    mentionsIn,
+    roomSessionKey,
+} from "./runtime/conversations.ts"
 export {
     claimLeases,
     LEASE_BEAT_MS,
@@ -340,16 +424,19 @@ export {
     buildRegistry,
     type DisposeReason,
     defaultStorePath,
+    type ReloadOutcome,
     Runtime,
     type RuntimeActivity,
     type RuntimeOptions,
     type StoreSource,
+    type ToolsRefreshOutcome,
 } from "./runtime/runtime.ts"
 export type { ReconcileReport } from "./runtime/schedules.ts"
 export {
     prepareScheduleWrite,
     reconcileSchedules,
     scheduleRunner,
+    scheduleSendOptions,
     scheduleSessionKey,
 } from "./runtime/schedules.ts"
 export type { CronSpec } from "./schedule/cron.ts"
@@ -411,7 +498,11 @@ export {
 } from "./store/buffer.ts"
 export {
     formatSessionKey,
+    isConversationOf,
+    isHead,
     isSessionKey,
+    KEY_SYMBOLS,
+    keySymbols,
     parseSessionKey,
     type SessionParts,
 } from "./store/session-key.ts"
@@ -437,9 +528,14 @@ export type {
     AgentFootprint,
     AgentStateRecord,
     AgentStateStore,
+    AssignmentRecord,
     // The scope vocabulary, exported as types because the server enforces it, the CLI mints with
     // it and the client reads it back — three consumers, one definition.
     Capability,
+    ConversationKind,
+    ConversationMessageRecord,
+    ConversationRecord,
+    ConversationStore,
     DeliveryBacklog,
     DeliveryRecord,
     DeliveryStatus,
@@ -449,18 +545,21 @@ export type {
     HandoffRecord,
     HandoffStore,
     KeyScope,
-    KVStore,
     // Exported so the CLI can read a lease's address without re-declaring the row's shape —
     // the `stop` path needs `baseUrl`, and a second definition of it is the drift this repo
     // keeps paying for.
     LeaseRecord,
     LeaseStore,
+    MemoryNoteRecord,
+    MemoryReadRecord,
     MessagePage,
     MessageStore,
     ModelCallRecord,
     OperatorKeyRecord,
     OperatorKeyStore,
     OutboxStore,
+    ParticipantRecord,
+    ProjectRecord,
     RuntimeMode,
     ScheduleFired,
     ScheduleOrigin,
@@ -492,6 +591,8 @@ export {
     SUBMIT_ARTIFACT,
     submitArtifactTool,
 } from "./team/artifact.ts"
+export { ASK_AGENT, type AskPeer, askAgentTool } from "./team/ask.ts"
+export { isChildSession } from "./team/child-session.ts"
 export { type ExpandedTeams, expandTeams } from "./team/expand.ts"
 export {
     type HandoffCost,
@@ -499,6 +600,13 @@ export {
     type HandoffTarget,
     runHandoff,
 } from "./team/handoff.ts"
+export {
+    type AskPeerInfo,
+    askPeerSignature,
+    askPeersOf,
+    type RelayClient,
+    type RemotePeer,
+} from "./team/relay.ts"
 export {
     checkTeamGraph,
     HANDOFF,
@@ -544,6 +652,7 @@ export {
     hashArgs,
     planIntents,
 } from "./tools/execute.ts"
+export { parametersFromJsonSchema, type SchemaConversion } from "./tools/json-schema.ts"
 export {
     LOCAL_PROVIDER_ID,
     LOCAL_TOOL_SLUGS,
@@ -595,6 +704,8 @@ export type {
     FieldError,
     JsonSchemaNode,
     JsonType,
+    RefusedTool,
+    ScalarType,
     ScriptRunner,
     ScriptRunRequest,
     ScriptRunResult,
@@ -610,6 +721,7 @@ export type {
     ToolProviderRefresh,
     ToolResult,
     ToolSpec,
+    ToolUsage,
     WorkspaceWriteTarget,
 } from "./tools/types.ts"
 export { VERSION } from "./version.ts"

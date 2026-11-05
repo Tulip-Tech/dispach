@@ -227,6 +227,36 @@ describe("a turn, end to end", () => {
         await runtime.stop()
     })
 
+    test("send({ chunks }) keeps a reply that streamed before the reader attached", async () => {
+        // The web page lost every quick reply this way: the turn finished its tokens in the gap
+        // between the POST and the attach, the replay had none, and the reply was never drawn.
+        const { client, runtime } = await harness({ reply: "Quick answer." })
+        const turn = await client.agent("assistant").send("hi", { chunks: true })
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        let text = ""
+        for await (const item of turn.stream({ chunks: true })) {
+            if (item.kind === "event" && item.event.type === "model.chunk") {
+                if (item.event.data.kind === "text") text += item.event.data.delta
+            }
+        }
+        expect(text).toBe("Quick answer.")
+        await runtime.stop()
+    })
+
+    test("children is asked for on the stream's query, and only when set", async () => {
+        const urls: string[] = []
+        const recording = (async (url: string | URL | Request) => {
+            urls.push(String(url))
+            return new Response("", { headers: { "content-type": "text/event-stream" } })
+        }) as typeof fetch
+        const client = createClient({ baseUrl: "http://127.0.0.1:7420", fetch: recording })
+        const turn = client.agent("assistant").turn("turn_1")
+        for await (const _ of turn.stream({ children: true, chunks: true })) break
+        for await (const _ of turn.stream()) break
+        expect(urls[0]).toEndWith("/turns/turn_1/stream?chunks=true&children=true")
+        expect(urls[1]).toEndWith("/turns/turn_1/stream")
+    })
+
     test("tokens are absent unless asked for", async () => {
         // Default off, per connection. `stream()` with no options must carry no `model.chunk`.
         const { client, runtime } = await harness()
@@ -606,6 +636,38 @@ describe("introspection", () => {
     })
 })
 
+describe("configuration writes (pilot.15)", () => {
+    test("setConfigs makes several changes in one reload, and a repeated one reloads nothing", async () => {
+        const { client, runtime } = await harness()
+        const agent = client.agent("assistant")
+        let reloads = 0
+        runtime.bus.on("agent.reloaded", () => {
+            reloads += 1
+        })
+        const first = await agent.setConfigs([
+            { path: "limits.maxSteps", value: "12" },
+            { path: "model.main.temperature", value: "0.2" },
+        ])
+        expect(first.changes.map((change) => change.changed)).toEqual([true, true])
+        expect(first.reloaded).toBe(true)
+        expect(reloads).toBe(1)
+        const again = await agent.setConfigs([
+            { path: "limits.maxSteps", value: "12" },
+            { path: "model.main.temperature", remove: true },
+        ])
+        expect(again.changes.map((change) => change.changed)).toEqual([false, true])
+        expect(reloads).toBe(2)
+        const same = await agent.setConfig("limits.maxSteps", "12")
+        expect({ changed: same.changed, reloaded: same.reloaded }).toEqual({
+            changed: false,
+            reloaded: false,
+        })
+        expect(reloads).toBe(2)
+        expect(runtime.list()[0]?.manifest.limits.maxSteps).toBe(12)
+        await runtime.stop()
+    })
+})
+
 describe("the frame mapper", () => {
     /** A synthetic SSE body, so a frame this client's own paths never produce can be tested. */
     function sse(frames: { event: string; data: unknown }[]): ReadableStream<Uint8Array> {
@@ -744,6 +806,54 @@ describe("every read is unwrapped the way its route wraps it", () => {
         await runtime.stop()
     })
 
+    test("the 0.2.2 console's methods reach their routes, and a refusal is typed", async () => {
+        /**
+         * Each of these was either called by the console with no client test behind it, or done
+         * with a raw `fetch` beside the client (a participant delete that ignored the response, so
+         * a refused delete looked like one that worked). Reaching the route is the claim; a
+         * refusal counts as reaching it when it is the route's own typed answer, not a 404.
+         */
+        const { client, runtime } = await harness()
+        const agent = client.agent("assistant")
+
+        const preview = await agent.previewSchedule({ kind: "every", expr: "15m", count: 2 })
+        expect(preview.next).toHaveLength(2)
+        expect(Array.isArray((await agent.refreshTools()).providers)).toBe(true)
+        expect(Array.isArray((await agent.workspaceFiles()).files)).toBe(true)
+
+        await client.registerParticipant({ id: "user:eve", name: "Eve" })
+        expect(await client.deleteParticipant("user:eve")).toEqual({
+            id: "user:eve",
+            deleted: true,
+        })
+        expect((await client.participants()).map((p) => p.id)).not.toContain("user:eve")
+
+        const backup = await client.backup()
+        // gzip's magic number: a tarball, not a JSON error body read as bytes.
+        expect([...new Uint8Array(await backup.arrayBuffer()).slice(0, 2)]).toEqual([0x1f, 0x8b])
+
+        const code = async (call: () => Promise<unknown>) => {
+            try {
+                await call()
+                return "resolved"
+            } catch (error) {
+                return error instanceof DispachError ? error.code : String(error)
+            }
+        }
+        // No remover on an embedded handler, no channel `tg`, not made from a template: each is the
+        // route's own refusal, which a 404 from a misspelt path would not be.
+        expect(await code(() => client.deleteAgent("assistant", "assistant"))).toBe(
+            "agent_remove_unsupported",
+        )
+        expect(
+            await code(() => agent.deliver({ channel: "tg", to: "1", text: "hi", key: "k1" })),
+        ).not.toMatch(/^(resolved|not_found|route_not_found)$/)
+        expect(await code(() => agent.setVars({ name: "x" }))).not.toMatch(
+            /^(resolved|not_found|route_not_found)$/,
+        )
+        await runtime.stop()
+    })
+
     test("the step list is an array even when this server cannot provision", async () => {
         /**
          * The same class as `schedules()` above and the reason this is asserted rather than typed:
@@ -775,6 +885,77 @@ describe("webhooks", () => {
         expect(JSON.stringify(listed)).not.toContain(created.secret)
         expect((await client.deleteWebhook(created.subscriptionId)).deleted).toBe(true)
         expect(await client.webhooks()).toEqual([])
+        await runtime.stop()
+    })
+})
+
+describe("conversations", () => {
+    test("participants, conversations and the message log are the shapes the server sends", async () => {
+        const { client, runtime } = await harness()
+        const agentId = (await client.agents())[0]?.id ?? ""
+        await client.registerParticipant({ id: "user:ada", role: "admin" })
+        const participants = await client.participants()
+        expect(Array.isArray(participants)).toBe(true)
+        expect(participants.map((p) => p.id)).toEqual(["user:ada"])
+
+        const room = await client.createConversation({
+            kind: "room",
+            members: ["user:ada", `agent:${agentId}`],
+        })
+        expect(Array.isArray(room.members)).toBe(true)
+        const listed = await client.conversations()
+        expect(Array.isArray(listed)).toBe(true)
+        expect((await client.conversation(room.id)).id).toBe(room.id)
+
+        // No mention, so no agent answers: the log holds exactly what was posted.
+        const posted = await client.postMessage(room.id, { text: "hello", authorId: "user:ada" })
+        expect(posted.hop).toBe(0)
+        const log = await client.conversationMessages(room.id)
+        expect(Array.isArray(log.messages)).toBe(true)
+        expect(log.messages.map((m) => m.text)).toEqual(["hello"])
+        expect(log.nextAfter).toBe(posted.seq)
+
+        expect((await client.setPresence("user:ada", "offline")).presence).toBe("offline")
+        const actions = await client.actions({ status: "pending" })
+        expect(Array.isArray(actions)).toBe(true)
+
+        const assigned = await client.agent(agentId).assign("user:ada")
+        expect(assigned.participantId).toBe("user:ada")
+        expect((await client.agent(agentId).unassign()).unassigned).toBe(true)
+
+        // Shared memory scopes (Phase 29): lists are lists, records are records.
+        const note = await client.addNote({ scope: "space", text: "The launch is on Friday" })
+        expect(note.scope).toBe("space")
+        const notes = await client.notes("space")
+        expect(Array.isArray(notes)).toBe(true)
+        expect(notes.map((n) => n.id)).toEqual([note.id])
+        expect(Array.isArray(await client.memoryReads("user:ada"))).toBe(true)
+        const project = await client.putProject("apollo", { agents: [agentId] })
+        expect(Array.isArray(project.agents)).toBe(true)
+        expect((await client.projects()).map((p) => p.id)).toEqual(["apollo"])
+        expect((await client.setSpaceWriter("user:ada")).writer).toBe("user:ada")
+        expect((await client.deleteNote(note.id)).deleted).toBe(true)
+        expect((await client.deleteProject("apollo")).deleted).toBe(true)
+
+        // An agent bundle (R11): a list of files out, a report with lists in.
+        const bundle = await client.agent(agentId).exportBundle()
+        expect(Array.isArray(bundle.files)).toBe(true)
+        const report = await client.agent(agentId).importBundle(bundle)
+        expect(Array.isArray(report.added)).toBe(true)
+        expect(report.reload).toBe("none")
+        await runtime.stop()
+    })
+
+    test("rotation on a channel-peer agent is a typed refusal, and a session says whether it is current", async () => {
+        const { client, runtime } = await harness()
+        const agentId = (await client.agents())[0]?.id ?? ""
+        const agent = client.agent(agentId)
+        expect((await agent.describe()).sessionScope).toBe("channel-peer")
+        const caught = await agent.rotateSession().catch((error: unknown) => error)
+        expect(caught).toBeInstanceOf(DispachError)
+        expect((caught as DispachError).code).toBe("session_not_rotatable")
+        await runtime.agent(agentId).store.sessions.ensure(agentId, "api:a")
+        expect((await agent.sessions()).map((s) => s.head)).toEqual([true])
         await runtime.stop()
     })
 })
@@ -988,5 +1169,23 @@ describe("activity", () => {
         expect(activity.idle).toBe(true)
         expect(activity.deliveries.webhooks.pending).toBe(0)
         await runtime.stop()
+    })
+})
+
+describe("an error that stands for several", () => {
+    test("its failures are on the error and in what an uncaught throw prints", () => {
+        const error = new DispachError({
+            code: "manifest_validation_failed",
+            message: "Manifest failed 2 validation rules.",
+            hint: "Each failure below names its field path and its fix.",
+            details: [
+                { code: "a", message: "first is wrong", hint: "h", field: "model.main.baseUrl" },
+                { code: "b", message: "second is wrong", hint: "h" },
+            ],
+        })
+        expect(error.details).toHaveLength(2)
+        expect(error.message).toBe(
+            "Manifest failed 2 validation rules.\n  - model.main.baseUrl: first is wrong\n  - second is wrong\n  hint: Each failure below names its field path and its fix.",
+        )
     })
 })

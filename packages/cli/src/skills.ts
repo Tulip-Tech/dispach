@@ -31,7 +31,7 @@ import {
     checkSkillAuthoring,
     type ErrorDetail,
     editManifestSync,
-    HarnessError,
+    isHarnessError,
     isSkillName,
     loadManifest,
     loadSkills,
@@ -186,7 +186,7 @@ export function skillsCommand(options: SkillsOptions): number {
                 return validate(catalogue.skills, options)
         }
     } catch (error) {
-        if (options.json === true && error instanceof HarnessError) {
+        if (options.json === true && isHarnessError(error)) {
             process.stdout.write(
                 `${JSON.stringify({ ok: false, error: error.toDetail(), details: error.details }, null, 2)}\n`,
             )
@@ -216,7 +216,7 @@ function unconfigured(options: SkillsOptions): number {
     // recommending the manual edit.
     process.stdout.write(
         "this agent has no skills configured\n\n" +
-            "  · find one and install it — searches the catalogues, 440+ skills:\n" +
+            "  · find one and install it — searches the configured catalogues for skills:\n" +
             "      sources search <what it should do>\n" +
             `      skills install ${options.manifestPath} <source>/<skill>\n\n` +
             "  · or write your own from a template:\n" +
@@ -264,7 +264,7 @@ function list(
 
     if (skills.length === 0) {
         process.stdout.write(
-            `no skills in ${dir}\n\n  \`sources search <what it should do>\` ranks 440+ from the configured catalogues, then\n  \`skills install <agent> <source>/<skill>\`. \`skills new <agent> <name>\` writes one from a template.\n`,
+            `no skills in ${dir}\n\n  \`sources search <what it should do>\` ranks the skills in the configured catalogues, then\n  \`skills install <agent> <source>/<skill>\`. \`skills new <agent> <name>\` writes one from a template.\n`,
         )
         return EXIT_OK
     }
@@ -740,7 +740,7 @@ function locate(
     try {
         parsed = parseSkillRef(ref)
     } catch (error) {
-        if (!(error instanceof HarnessError)) throw error
+        if (!isHarnessError(error)) throw error
         process.stdout.write(`${error.message}\n\n  ${error.hint}\n`)
         return undefined
     }

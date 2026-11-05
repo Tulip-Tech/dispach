@@ -21,6 +21,7 @@ import type {
     AgentStateStore,
     ArtifactRecord,
     ArtifactStore,
+    ConversationStore,
     DeliveryBacklog,
     DeliveryRecord,
     DeliveryStatus,
@@ -28,7 +29,6 @@ import type {
     HandoffStore,
     InboundKeyClaim,
     KeyScope,
-    KVStore,
     LeaseClaim,
     LeaseRecord,
     LeaseStore,
@@ -36,6 +36,7 @@ import type {
     MemorySourceState,
     MemoryStore,
     MessagePage,
+    MessageReach,
     MessageStore,
     OperatorKeyRecord,
     OperatorKeyStore,
@@ -62,7 +63,8 @@ import type {
     WebhookStore,
     WebhookSubscription,
 } from "../store.ts"
-import { DEFAULT_KEY_TOUCH_MS } from "../store.ts"
+import { DEFAULT_KEY_TOUCH_MS, FORGOTTEN_MARKER } from "../store.ts"
+import { sqliteConversations } from "./conversations.ts"
 import type { OpenOptions, SqlDatabase, SqlParam, SqlStatement } from "./driver.ts"
 import { openDatabase } from "./driver.ts"
 import { type MigrationReport, migrate } from "./migrations.ts"
@@ -114,6 +116,7 @@ interface SessionRow {
     peer_id: string
     thread: string | null
     phase: string | null
+    recall: number
     created_at: string
     updated_at: string
 }
@@ -122,6 +125,16 @@ interface SummaryRow extends SessionRow {
     messages: number
     turns: number
     last_activity_at: string
+    compacted_at: string | null
+}
+
+interface CheckpointRow {
+    through_id: number
+    messages: string
+    digest: string
+    tokens_before: number
+    tokens_after: number
+    created_at: string
 }
 
 interface MessageRow {
@@ -149,6 +162,78 @@ interface MessageRow {
  */
 const MESSAGE_COLUMNS =
     "id, session_key, turn_id, role, content, tool_calls, tool_call_id, origin, tainted, created_at"
+const PREFIXED_MESSAGE_COLUMNS = MESSAGE_COLUMNS.split(", ")
+    .map((column) => `m.${column}`)
+    .join(", ")
+
+function escapeLike(text: string): string {
+    return text.replace(/[\\%_]/g, (char) => `\\${char}`)
+}
+
+/**
+ * Prose a person or the model wrote (no `origin`), not already forgotten, within `reach`. A turn
+ * "is" a participant's when it was taken for them or sent by them; `unattributed` adds turns that
+ * record nobody, which is every API turn before migration 31.
+ */
+function proseWhere(reach: MessageReach): { sql: string; params: SqlParam[] } {
+    const scoped = reachWhere(reach)
+    return {
+        sql: `m.origin IS NULL AND m.role IN ('user', 'assistant') AND ${scoped.sql}`,
+        params: scoped.params,
+    }
+}
+
+/** Not already forgotten, and within `reach`. Shared by the prose search and the scrub. */
+function reachWhere(reach: MessageReach): { sql: string; params: SqlParam[] } {
+    const base = `m.content <> '${FORGOTTEN_MARKER.replaceAll("'", "''")}'`
+    if (reach.participant === undefined) return { sql: base, params: [] }
+    const unattributed =
+        reach.unattributed === true ? " OR (t.participant_id IS NULL AND t.sender IS NULL)" : ""
+    return {
+        sql: `${base} AND (t.participant_id = ? OR t.sender = ?${unattributed})`,
+        params: [reach.participant, reach.participant],
+    }
+}
+
+/** A stored tool-call list with every argument value replaced by `marker`. */
+function blankArguments(calls: unknown, marker: string): unknown {
+    if (!Array.isArray(calls)) return calls
+    return calls.map((call) => {
+        if (typeof call !== "object" || call === null || !("arguments" in call)) return call
+        const raw = (call as { arguments: unknown }).arguments
+        if (typeof raw !== "string") return call
+        try {
+            return {
+                ...call,
+                arguments: JSON.stringify(scrubValue(JSON.parse(raw), () => true, marker)),
+            }
+        } catch {
+            return { ...call, arguments: JSON.stringify({}) }
+        }
+    })
+}
+
+/** Every string in a parsed tool-call list that contains forgotten text, replaced; the shape kept. */
+function scrubValue(value: unknown, hit: (text: string) => boolean, marker: string): unknown {
+    if (typeof value === "string") {
+        // A native call's `arguments` is itself JSON, so look inside before judging the string whole.
+        if (value.startsWith("{") || value.startsWith("[")) {
+            try {
+                return JSON.stringify(scrubValue(JSON.parse(value), hit, marker))
+            } catch {
+                // Not JSON after all: judged as text below.
+            }
+        }
+        return hit(value) ? marker : value
+    }
+    if (Array.isArray(value)) return value.map((entry) => scrubValue(entry, hit, marker))
+    if (typeof value === "object" && value !== null) {
+        return Object.fromEntries(
+            Object.entries(value).map(([key, entry]) => [key, scrubValue(entry, hit, marker)]),
+        )
+    }
+    return value
+}
 
 /**
  * The origin union without `undefined`.
@@ -221,9 +306,11 @@ interface TurnRow {
     sender: string | null
     sender_name: string | null
     sender_kind: string | null
+    note: string | null
     error_code: string | null
     error_message: string | null
     error_hint: string | null
+    error_detail: string | null
     started_at: string
     ended_at: string | null
     duration_ms: number | null
@@ -250,6 +337,7 @@ interface HandoffRow {
     member_id: string
     member_session: string
     task: string
+    kind: string
     outcome: string
     artifact: string | null
     error_code: string | null
@@ -282,6 +370,8 @@ interface DeliveryRow {
     chunk_index: number
     chunk_total: number
     body: string
+    attachment_path: string | null
+    attachment_type: string | null
     status: string
     attempts: number
     next_attempt_at: string
@@ -309,6 +399,7 @@ function toSession(row: SessionRow): SessionRecord {
         peerId: row.peer_id,
         ...(row.thread === null ? {} : { thread: row.thread }),
         ...(row.phase === null ? {} : { phase: row.phase }),
+        ...(row.recall === 0 ? { recall: false as const } : {}),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
     }
@@ -320,6 +411,7 @@ function toSummary(row: SummaryRow): SessionSummary {
         messages: row.messages,
         turns: row.turns,
         lastActivityAt: row.last_activity_at,
+        ...(row.compacted_at === null ? {} : { compactedAt: row.compacted_at }),
     }
 }
 
@@ -464,6 +556,7 @@ function toHandoff(row: HandoffRow): HandoffRecord {
         memberId: row.member_id,
         memberSession: row.member_session,
         task: row.task,
+        kind: row.kind === "ask" ? "ask" : "handoff",
         outcome: row.outcome as HandoffRecord["outcome"],
         ...(row.artifact === null ? {} : { artifact: row.artifact }),
         ...(row.error_code === null ? {} : { errorCode: row.error_code }),
@@ -495,7 +588,10 @@ function toKeyScope(raw: string | null): KeyScope | undefined {
         const scope = parsed as KeyScope
         // Every field optional, so an empty object is a legitimate "scoped to nothing in
         // particular" — which is an unscoped key by another name and is reported as one.
-        return scope.agents === undefined && scope.sessions === undefined && scope.can === undefined
+        return scope.agents === undefined &&
+            scope.sessions === undefined &&
+            scope.can === undefined &&
+            scope.participant === undefined
             ? undefined
             : scope
     } catch {
@@ -541,9 +637,11 @@ function toTurn(row: TurnRow): TurnRecord {
         ...(row.sender === null ? {} : { sender: row.sender }),
         ...(row.sender_name === null ? {} : { senderName: row.sender_name }),
         ...(row.sender_kind === null ? {} : { senderKind: row.sender_kind as SenderKind }),
+        ...(row.note === null ? {} : { note: row.note }),
         ...(row.error_code === null ? {} : { errorCode: row.error_code }),
         ...(row.error_message === null ? {} : { errorMessage: row.error_message }),
         ...(row.error_hint === null ? {} : { errorHint: row.error_hint }),
+        ...(row.error_detail === null ? {} : { errorDetail: row.error_detail }),
         startedAt: row.started_at,
         ...(row.ended_at === null ? {} : { endedAt: row.ended_at }),
         ...(row.duration_ms === null ? {} : { durationMs: row.duration_ms }),
@@ -564,6 +662,14 @@ function toDelivery(row: DeliveryRow): DeliveryRecord {
         chunkIndex: row.chunk_index,
         chunkTotal: row.chunk_total,
         body: row.body,
+        ...(row.attachment_path === null
+            ? {}
+            : {
+                  attachment: {
+                      path: row.attachment_path,
+                      mimeType: row.attachment_type ?? "application/octet-stream",
+                  },
+              }),
         status: row.status as DeliveryStatus,
         attempts: row.attempts,
         nextAttemptAt: row.next_attempt_at,
@@ -587,6 +693,9 @@ interface ScheduleRow {
     deliver_to: string | null
     session_mode: string
     role: string | null
+    tools_allow: string | null
+    timeout_ms: number | null
+    max_steps: number | null
     enabled: number
     origin: string
     anchor_at: string
@@ -621,6 +730,10 @@ function toSchedule(row: ScheduleRow): ScheduleRecord {
         deliverTo: row.deliver_to ?? undefined,
         sessionMode: row.session_mode,
         role: row.role ?? undefined,
+        toolsAllow:
+            row.tools_allow === null ? undefined : (JSON.parse(row.tools_allow) as string[]),
+        timeoutMs: row.timeout_ms ?? undefined,
+        maxSteps: row.max_steps ?? undefined,
         enabled: row.enabled !== 0,
         origin: row.origin as ScheduleOrigin,
         anchorAt: row.anchor_at,
@@ -686,7 +799,7 @@ export class SqliteStore implements Store {
     readonly outbox: OutboxStore
     readonly leases: LeaseStore
     readonly agentState: AgentStateStore
-    readonly kv: KVStore
+    readonly conversations: ConversationStore
     readonly artifacts: ArtifactStore
     readonly memory: MemoryStore
     readonly schedules: ScheduleStore
@@ -731,13 +844,19 @@ export class SqliteStore implements Store {
                             s.updated_at,
                             COALESCE((SELECT MAX(created_at) FROM messages m
                                        WHERE m.agent_id = s.agent_id AND m.session_key = s.session_key), '')
-                        ) AS last_activity_at
+                        ) AS last_activity_at,
+                        (SELECT created_at FROM session_checkpoints c
+                          WHERE c.agent_id = s.agent_id AND c.session_key = s.session_key) AS compacted_at
                    FROM sessions s
                   WHERE s.agent_id = ?
                   ORDER BY last_activity_at DESC`,
             ),
             sessionSetPhase: db.prepare(
                 "UPDATE sessions SET phase = ?, updated_at = ? WHERE agent_id = ? AND session_key = ?",
+            ),
+            sessionSetRecall: db.prepare(
+                // No `updated_at`: a switch is not activity, and bumping it would reorder the listing.
+                "UPDATE sessions SET recall = ? WHERE agent_id = ? AND session_key = ?",
             ),
             sessionDelete: db.prepare(
                 "DELETE FROM sessions WHERE agent_id = ? AND session_key = ?",
@@ -822,6 +941,25 @@ export class SqliteStore implements Store {
             memoryDf: db.prepare(MEMORY_DF_SQL),
             memoryCandidates: db.prepare(MEMORY_CANDIDATES_SQL),
             memoryVocabulary: db.prepare(MEMORY_VOCABULARY_SQL),
+            historySince: db.prepare(
+                `SELECT ${MESSAGE_COLUMNS} FROM messages
+                  WHERE agent_id = ? AND session_key = ? AND id > ? ORDER BY id ASC`,
+            ),
+            checkpointGet: db.prepare(
+                "SELECT * FROM session_checkpoints WHERE agent_id = ? AND session_key = ?",
+            ),
+            checkpointSet: db.prepare(
+                `INSERT INTO session_checkpoints
+                    (agent_id, session_key, through_id, messages, digest, tokens_before, tokens_after, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (agent_id, session_key) DO UPDATE SET
+                     through_id = excluded.through_id, messages = excluded.messages,
+                     digest = excluded.digest, tokens_before = excluded.tokens_before,
+                     tokens_after = excluded.tokens_after, created_at = excluded.created_at`,
+            ),
+            checkpointDelete: db.prepare(
+                "DELETE FROM session_checkpoints WHERE agent_id = ? AND session_key = ?",
+            ),
             historyAll: db.prepare(
                 `SELECT ${MESSAGE_COLUMNS} FROM messages
                   WHERE agent_id = ? AND session_key = ? ORDER BY id ASC`,
@@ -853,8 +991,8 @@ export class SqliteStore implements Store {
             turnInsert: db.prepare(
                 `INSERT INTO turns
                      (turn_id, agent_id, session_key, status, source, input,
-                      sender, sender_name, sender_kind, started_at)
-                 VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`,
+                      sender, sender_name, sender_kind, note, participant_id, started_at)
+                 VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)`,
             ),
             // `OR IGNORE` rather than `ON CONFLICT DO UPDATE`: a second claim must **not** move the
             // key onto the new turn id. The whole point is that the first turn keeps it.
@@ -871,7 +1009,8 @@ export class SqliteStore implements Store {
                     SET status = ?, text = ?, reasoning = ?, steps = ?,
                         prompt_tokens = ?, output_tokens = ?,
                         cached_prompt_tokens = ?, cache_source = ?, duration_ms = ?,
-                        error_code = ?, error_message = ?, error_hint = ?, ended_at = ?
+                        error_code = ?, error_message = ?, error_hint = ?, error_detail = ?,
+                        ended_at = ?
                   WHERE turn_id = ?`,
             ),
             turnGet: db.prepare("SELECT * FROM turns WHERE turn_id = ?"),
@@ -885,10 +1024,13 @@ export class SqliteStore implements Store {
                   ORDER BY rowid DESC LIMIT ?`,
             ),
             modelCallInsert: db.prepare(
-                `INSERT INTO model_calls
+                // OR IGNORE: a call recorded twice under one call_id is one row, which is what
+                // makes the id an idempotency key rather than a label.
+                `INSERT OR IGNORE INTO model_calls
                      (agent_id, session_key, turn_id, role, model, prompt_tokens, prompt_reported,
-                      cached_prompt_tokens, output_tokens, output_reported, sender, at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      cached_prompt_tokens, output_tokens, output_reported, sender, at,
+                      call_id, cache_write_tokens, images, audio_seconds)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             ),
             modelCallDeleteAll: db.prepare("DELETE FROM model_calls WHERE agent_id = ?"),
             webhookInsert: db.prepare(
@@ -1033,9 +1175,9 @@ export class SqliteStore implements Store {
             outboxInsert: db.prepare(
                 `INSERT INTO outbox
                      (agent_id, dedupe_key, group_key, session_key, turn_id, channel_id, recipient,
-                      thread, chunk_index, chunk_total, body, status, next_attempt_at,
-                      created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                      thread, chunk_index, chunk_total, body, attachment_path, attachment_type,
+                      status, next_attempt_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                  ON CONFLICT (agent_id, dedupe_key) DO NOTHING`,
             ),
             outboxById: db.prepare("SELECT * FROM outbox WHERE id = ?"),
@@ -1129,14 +1271,6 @@ export class SqliteStore implements Store {
                   LIMIT ?`,
             ),
 
-            kvGet: db.prepare("SELECT value FROM kv WHERE scope = ? AND key = ?"),
-            kvSet: db.prepare(
-                `INSERT INTO kv (scope, key, value, updated_at) VALUES (?, ?, ?, ?)
-                 ON CONFLICT (scope, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-            ),
-            kvDelete: db.prepare("DELETE FROM kv WHERE scope = ? AND key = ?"),
-            kvAll: db.prepare("SELECT key, value FROM kv WHERE scope = ? ORDER BY key"),
-
             // ── one agent's footprint, and its removal ──
             //
             // Counted per table rather than derived from `sessionList`, because three of these do not
@@ -1160,8 +1294,8 @@ export class SqliteStore implements Store {
             handoffInsert: db.prepare(
                 `INSERT INTO handoffs
                      (handoff_id, agent_id, session_key, turn_id, member_id, member_session,
-                      task, outcome, started_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+                      task, outcome, started_at, kind)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
             ),
             handoffFinish: db.prepare(
                 `UPDATE handoffs
@@ -1207,6 +1341,16 @@ export class SqliteStore implements Store {
                 "SELECT COUNT(*) AS c FROM operator_keys WHERE revoked_at IS NULL",
             ),
             inboundKeyDeleteAll: db.prepare("DELETE FROM inbound_keys WHERE agent_id = ?"),
+            headGet: db.prepare(
+                "SELECT head_key FROM session_heads WHERE agent_id = ? AND base_key = ?",
+            ),
+            headSet: db.prepare(
+                `INSERT INTO session_heads (agent_id, base_key, head_key, rotated_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (agent_id, base_key) DO UPDATE SET
+                     head_key = excluded.head_key, rotated_at = excluded.rotated_at`,
+            ),
+            headList: db.prepare("SELECT base_key, head_key FROM session_heads WHERE agent_id = ?"),
+            headDeleteAll: db.prepare("DELETE FROM session_heads WHERE agent_id = ?"),
             outboxDeleteAll: db.prepare("DELETE FROM outbox WHERE agent_id = ?"),
             leaseDeleteAll: db.prepare("DELETE FROM runtime_leases WHERE agent_id = ?"),
             // A union rather than a join: an agent can own rows in any one of these and none of the
@@ -1261,6 +1405,19 @@ export class SqliteStore implements Store {
                 ensureSession(agentId, sessionKey)
                 q.sessionSetPhase.run(phase, nowIso(), agentId, sessionKey)
             },
+            setRecall: async (agentId, sessionKey, recall) => {
+                ensureSession(agentId, sessionKey)
+                db.transaction(() => {
+                    q.sessionSetRecall.run(recall ? 1 : 0, agentId, sessionKey)
+                    // Dropped now, as `clear` does, rather than at the next turn's reconcile: the
+                    // switch exists because the passages are steering answers today. Switched back
+                    // on, the next index pass finds the source missing and indexes it again.
+                    if (!recall) {
+                        q.memoryDeleteSource.run(agentId, sessionSource(sessionKey))
+                        q.memorySourceDelete.run(agentId, sessionSource(sessionKey))
+                    }
+                })
+            },
             clear: async (agentId, sessionKey) => {
                 // Files remain canonical and untouched. The session projection is derived from the
                 // rows being cleared, so keeping it would make deleted prose retrievable until a
@@ -1268,6 +1425,8 @@ export class SqliteStore implements Store {
                 db.transaction(() => {
                     q.messagesDelete.run(agentId, sessionKey)
                     q.turnsDelete.run(agentId, sessionKey)
+                    // It summarises messages that no longer exist.
+                    q.checkpointDelete.run(agentId, sessionKey)
                     q.memoryDeleteSource.run(agentId, sessionSource(sessionKey))
                     q.memorySourceDelete.run(agentId, sessionSource(sessionKey))
                     q.sessionTouch.run(nowIso(), agentId, sessionKey)
@@ -1280,6 +1439,46 @@ export class SqliteStore implements Store {
                     q.memorySourceDelete.run(agentId, sessionSource(sessionKey))
                 })
             },
+            head: async (agentId, baseKey) =>
+                q.headGet.get<{ head_key: string }>(agentId, baseKey)?.head_key ?? baseKey,
+            rotate: async (agentId, baseKey, headKey) =>
+                db.transaction(() => {
+                    const previous =
+                        q.headGet.get<{ head_key: string }>(agentId, baseKey)?.head_key ?? baseKey
+                    q.headSet.run(agentId, baseKey, headKey, nowIso())
+                    return { previous }
+                }),
+            checkpoint: async (agentId, sessionKey) => {
+                const row = q.checkpointGet.get<CheckpointRow>(agentId, sessionKey)
+                if (row === undefined) return undefined
+                return {
+                    throughId: row.through_id,
+                    messages: JSON.parse(row.messages) as ChatMessage[],
+                    digest: row.digest === "model" ? "model" : "mechanical",
+                    tokensBefore: row.tokens_before,
+                    tokensAfter: row.tokens_after,
+                    createdAt: row.created_at,
+                }
+            },
+            setCheckpoint: async (agentId, sessionKey, checkpoint) => {
+                ensureSession(agentId, sessionKey)
+                q.checkpointSet.run(
+                    agentId,
+                    sessionKey,
+                    checkpoint.throughId,
+                    JSON.stringify(checkpoint.messages),
+                    checkpoint.digest,
+                    checkpoint.tokensBefore,
+                    checkpoint.tokensAfter,
+                    checkpoint.createdAt,
+                )
+            },
+            heads: async (agentId) =>
+                new Map(
+                    q.headList
+                        .all<{ base_key: string; head_key: string }>(agentId)
+                        .map((row) => [row.base_key, row.head_key] as const),
+                ),
         }
 
         this.messages = {
@@ -1325,6 +1524,8 @@ export class SqliteStore implements Store {
                 // that drops either hands the next turn an orphaned trace.
                 return rows.map(toChatMessage)
             },
+            historySince: async (agentId, sessionKey, afterId) =>
+                q.historySince.all<MessageRow>(agentId, sessionKey, afterId).map(toMessage),
             page: async (agentId, sessionKey, options) => {
                 const limit = options?.limit ?? DEFAULT_PAGE
                 const rows =
@@ -1345,6 +1546,169 @@ export class SqliteStore implements Store {
             },
             count: async (agentId, sessionKey) =>
                 q.messageCount.get<{ c: number }>(agentId, sessionKey)?.c ?? 0,
+            findProse: async (agentId, words, reach, limit) => {
+                if (words.length === 0) return []
+                const where = proseWhere(reach)
+                const like = words.map(() => "AND lower(m.content) LIKE ? ESCAPE '\\'").join(" ")
+                const rows = db
+                    .prepare(
+                        `SELECT ${PREFIXED_MESSAGE_COLUMNS} FROM messages m
+                           LEFT JOIN turns t ON t.turn_id = m.turn_id
+                          WHERE m.agent_id = ? AND ${where.sql} ${like}
+                          ORDER BY m.id DESC LIMIT ?`,
+                    )
+                    .all<MessageRow>(
+                        agentId,
+                        ...where.params,
+                        ...words.map((word) => `%${escapeLike(word.toLowerCase())}%`),
+                        limit,
+                    )
+                return rows.map(toMessage)
+            },
+            redact: async (agentId, ids, reach, marker) => {
+                if (ids.length === 0) return []
+                const where = proseWhere(reach)
+                const rows = db
+                    .prepare(
+                        `SELECT ${PREFIXED_MESSAGE_COLUMNS} FROM messages m
+                           LEFT JOIN turns t ON t.turn_id = m.turn_id
+                          WHERE m.agent_id = ? AND ${where.sql}
+                            AND m.id IN (${ids.map(() => "?").join(", ")})`,
+                    )
+                    .all<MessageRow>(agentId, ...where.params, ...ids)
+                const found = rows.map(toMessage)
+                db.transaction(() => {
+                    for (const message of found) {
+                        db.prepare("UPDATE messages SET content = ? WHERE id = ?").run(
+                            marker,
+                            message.id,
+                        )
+                        if (message.turnId === undefined) continue
+                        // The turn row is the audit record of the same words: the input for a person's
+                        // message, the reply and the reasoning that produced it for the agent's.
+                        if (message.role === "user") {
+                            db.prepare("UPDATE turns SET input = ? WHERE turn_id = ?").run(
+                                marker,
+                                message.turnId,
+                            )
+                        } else {
+                            db.prepare(
+                                "UPDATE turns SET text = ?, reasoning = '' WHERE turn_id = ?",
+                            ).run(marker, message.turnId)
+                        }
+                    }
+                })
+                return found
+            },
+            scrub: async (agentId, needles, reach, marker) => {
+                if (needles.length === 0) return { sessions: [], writeTurns: [] }
+                const where = reachWhere(reach)
+                // The arguments are stored as JSON, so a needle is looked for in its JSON-escaped form.
+                const forms = needles.map((needle) => JSON.stringify(needle).slice(1, -1))
+                const match = needles
+                    .map(() => "(m.content LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')")
+                    .join(" OR ")
+                const rows = db
+                    .prepare(
+                        `SELECT ${PREFIXED_MESSAGE_COLUMNS} FROM messages m
+                           LEFT JOIN turns t ON t.turn_id = m.turn_id
+                          WHERE m.agent_id = ? AND ${where.sql} AND (${match})`,
+                    )
+                    .all<MessageRow>(
+                        agentId,
+                        ...where.params,
+                        ...needles.flatMap((needle, index) => [
+                            `%${escapeLike(needle)}%`,
+                            `%${escapeLike(forms[index] ?? needle)}%`,
+                        ]),
+                    )
+                // LIKE matched case-insensitively; the replacement is exact, so only rows it changes count.
+                const hit = (text: string) => needles.some((needle) => text.includes(needle))
+                const touched = new Set<string>()
+                const writeTurns = new Set<string>()
+                db.transaction(() => {
+                    for (const row of rows) {
+                        const content = hit(row.content) ? marker : row.content
+                        const calls =
+                            row.tool_calls === null
+                                ? null
+                                : JSON.stringify(
+                                      scrubValue(JSON.parse(row.tool_calls), hit, marker),
+                                  )
+                        // Compared re-serialised, so formatting alone never counts as a change.
+                        const before =
+                            row.tool_calls === null
+                                ? null
+                                : JSON.stringify(JSON.parse(row.tool_calls))
+                        const callsChanged = calls !== before
+                        if (content === row.content && !callsChanged) continue
+                        // A `memory_write` whose argument held the text is the turn that saved the note.
+                        if (
+                            row.turn_id !== null &&
+                            callsChanged &&
+                            row.tool_calls?.includes('"memory_write"') === true
+                        ) {
+                            writeTurns.add(row.turn_id)
+                        }
+                        db.prepare(
+                            "UPDATE messages SET content = ?, tool_calls = ? WHERE id = ?",
+                        ).run(content, calls, row.id)
+                        touched.add(row.session_key)
+                    }
+                })
+                return { sessions: [...touched], writeTurns: [...writeTurns] }
+            },
+            redactTurns: async (agentId, turnIds, marker) => {
+                if (turnIds.length === 0) return { sessions: [], texts: [] }
+                const list = turnIds.map(() => "?").join(", ")
+                const sessions = db
+                    .prepare(
+                        `SELECT DISTINCT session_key FROM messages
+                          WHERE agent_id = ? AND turn_id IN (${list})`,
+                    )
+                    .all<{ session_key: string }>(agentId, ...turnIds)
+                // What is about to be replaced, so the caller can look for it in the webhook log.
+                const texts = [
+                    ...db
+                        .prepare(
+                            `SELECT content FROM messages
+                              WHERE agent_id = ? AND origin IS NULL AND role IN ('user', 'assistant')
+                                AND turn_id IN (${list})`,
+                        )
+                        .all<{ content: string }>(agentId, ...turnIds)
+                        .map((row) => row.content),
+                    ...db
+                        .prepare(
+                            `SELECT input, text FROM turns WHERE agent_id = ? AND turn_id IN (${list})`,
+                        )
+                        .all<{ input: string; text: string }>(agentId, ...turnIds)
+                        .flatMap((row) => [row.input, row.text]),
+                ].filter((text) => text !== marker && text.trim() !== "")
+                const calls = db
+                    .prepare(
+                        `SELECT id, tool_calls FROM messages
+                          WHERE agent_id = ? AND tool_calls IS NOT NULL AND turn_id IN (${list})`,
+                    )
+                    .all<{ id: number; tool_calls: string }>(agentId, ...turnIds)
+                db.transaction(() => {
+                    db.prepare(
+                        `UPDATE messages SET content = ?
+                          WHERE agent_id = ? AND role <> 'system' AND turn_id IN (${list})`,
+                    ).run(marker, agentId, ...turnIds)
+                    // Every argument value goes; each call's id and name stay, so the trace replays.
+                    for (const row of calls) {
+                        db.prepare("UPDATE messages SET tool_calls = ? WHERE id = ?").run(
+                            JSON.stringify(blankArguments(JSON.parse(row.tool_calls), marker)),
+                            row.id,
+                        )
+                    }
+                    db.prepare(
+                        `UPDATE turns SET input = ?, text = ?, reasoning = ''
+                          WHERE agent_id = ? AND turn_id IN (${list})`,
+                    ).run(marker, marker, agentId, ...turnIds)
+                })
+                return { sessions: sessions.map((row) => row.session_key), texts }
+            },
         }
 
         this.turns = {
@@ -1361,6 +1725,8 @@ export class SqliteStore implements Store {
                         record.sender?.id ?? null,
                         record.sender?.name ?? null,
                         record.sender?.kind ?? null,
+                        record.note ?? null,
+                        record.participantId ?? null,
                         ts,
                     )
                 })
@@ -1387,6 +1753,7 @@ export class SqliteStore implements Store {
                     outcome.errorCode,
                     outcome.errorMessage,
                     outcome.errorHint,
+                    outcome.errorDetail ?? null,
                     nowIso(),
                     turnId,
                 )
@@ -1517,6 +1884,8 @@ export class SqliteStore implements Store {
                             d.chunkIndex,
                             d.chunkTotal,
                             d.body,
+                            d.attachment?.path ?? null,
+                            d.attachment?.mimeType ?? null,
                             // Due immediately unless the caller says otherwise. A first attempt
                             // that waited would add latency to every reply to buy nothing —
                             // backoff starts at the first failure.
@@ -1687,23 +2056,6 @@ export class SqliteStore implements Store {
             },
         }
 
-        this.kv = {
-            get: async (scope, key) => q.kvGet.get<{ value: string }>(scope, key)?.value,
-            set: async (scope, key, value) => {
-                q.kvSet.run(scope, key, value, nowIso())
-            },
-            delete: async (scope, key) => {
-                q.kvDelete.run(scope, key)
-            },
-            all: async (scope) => {
-                const out: Record<string, string> = {}
-                for (const row of q.kvAll.all<{ key: string; value: string }>(scope)) {
-                    out[row.key] = row.value
-                }
-                return out
-            },
-        }
-
         this.artifacts = {
             put: async (agentId, sessionKey, artifacts, now) => {
                 if (artifacts.length === 0) return
@@ -1818,9 +2170,9 @@ export class SqliteStore implements Store {
             upsert: db.prepare(
                 `INSERT INTO schedules (
                      agent_id, id, kind, expr, timezone, task, deliver_channel, deliver_to,
-                     session_mode, role, enabled, origin, anchor_at, next_run_at, source_path,
-                     created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     session_mode, role, tools_allow, timeout_ms, max_steps, enabled, origin,
+                     anchor_at, next_run_at, source_path, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (agent_id, id) DO UPDATE SET
                      kind = excluded.kind,
                      expr = excluded.expr,
@@ -1830,6 +2182,9 @@ export class SqliteStore implements Store {
                      deliver_to = excluded.deliver_to,
                      session_mode = excluded.session_mode,
                      role = excluded.role,
+                     tools_allow = excluded.tools_allow,
+                     timeout_ms = excluded.timeout_ms,
+                     max_steps = excluded.max_steps,
                      enabled = excluded.enabled,
                      origin = excluded.origin,
                      anchor_at = excluded.anchor_at,
@@ -1893,6 +2248,7 @@ export class SqliteStore implements Store {
                     record.memberSession,
                     record.task,
                     record.startedAt,
+                    record.kind ?? "handoff",
                 )
             },
             finish: async (handoffId, outcome) => {
@@ -1968,6 +2324,9 @@ export class SqliteStore implements Store {
                     schedule.deliverTo ?? null,
                     schedule.sessionMode,
                     schedule.role ?? null,
+                    schedule.toolsAllow === undefined ? null : JSON.stringify(schedule.toolsAllow),
+                    schedule.timeoutMs ?? null,
+                    schedule.maxSteps ?? null,
                     schedule.enabled ? 1 : 0,
                     schedule.origin,
                     schedule.anchorAt,
@@ -2085,6 +2444,8 @@ export class SqliteStore implements Store {
             lease: q.leaseGet.get(agentId) !== undefined,
         })
 
+        const conversations = sqliteConversations(db)
+        this.conversations = conversations
         this.agentState = {
             get: async (agentId) => {
                 const row = q.agentStateGet.get<AgentStateRow>(agentId)
@@ -2150,6 +2511,38 @@ export class SqliteStore implements Store {
             ...(row.last_error === null ? {} : { lastError: row.last_error }),
         })
         this.webhooks = {
+            scrubBodies: async (agentId, needles, marker) => {
+                if (needles.length === 0) return 0
+                const forms = needles.map((needle) => JSON.stringify(needle).slice(1, -1))
+                const rows = db
+                    .prepare(
+                        `SELECT subscription_id, message_id, body FROM webhook_deliveries
+                          WHERE agent_id = ? AND (${forms.map(() => "body LIKE ? ESCAPE '\\'").join(" OR ")})`,
+                    )
+                    .all<{ subscription_id: string; message_id: string; body: string }>(
+                        agentId,
+                        ...forms.map((form) => `%${escapeLike(form)}%`),
+                    )
+                const hit = (text: string) => needles.some((needle) => text.includes(needle))
+                let changed = 0
+                db.transaction(() => {
+                    for (const row of rows) {
+                        let body: string
+                        try {
+                            body = JSON.stringify(scrubValue(JSON.parse(row.body), hit, marker))
+                        } catch {
+                            body = hit(row.body) ? JSON.stringify(marker) : row.body
+                        }
+                        if (body === row.body) continue
+                        db.prepare(
+                            `UPDATE webhook_deliveries SET body = ?
+                              WHERE subscription_id = ? AND message_id = ?`,
+                        ).run(body, row.subscription_id, row.message_id)
+                        changed += 1
+                    }
+                })
+                return changed
+            },
             create: async (sub) => {
                 q.webhookInsert.run(
                     sub.subscriptionId,
@@ -2259,6 +2652,10 @@ export class SqliteStore implements Store {
                     call.outputReported ? 1 : 0,
                     call.sender ?? null,
                     call.at,
+                    call.callId ?? null,
+                    call.cacheWriteTokens ?? null,
+                    call.images ?? null,
+                    call.audioSeconds ?? null,
                 )
             },
             report: async (query) => usageReport(db, query),
@@ -2279,9 +2676,11 @@ export class SqliteStore implements Store {
                 q.memorySourceDeleteAll.run(agentId)
                 q.leaseDeleteAll.run(agentId)
                 // Not in the footprint and still deleted — see `AgentFootprint`. Omitting it would
-                // leave rows keyed to an agent that no longer exists, which is the `kv` table's
-                // recorded failure with a column available to avoid it.
+                // leave rows keyed to an agent that no longer exists, which is the failure the
+                // removed `kv` table recorded, with a column available to avoid it.
                 q.inboundKeyDeleteAll.run(agentId)
+                // Which conversation a person's base key means: meaningless once the sessions are gone.
+                q.headDeleteAll.run(agentId)
                 // Also not in the footprint: a handoff envelope is a fact about a turn, and turns
                 // are already counted. Deleted for the reason inbound keys are — rows keyed to an
                 // agent that no longer exists.
@@ -2292,10 +2691,13 @@ export class SqliteStore implements Store {
                 // Its pending webhook deliveries too; the subscriptions are server-wide and stay.
                 q.webhookDeleteForAgent.run(agentId)
                 // Also not in the footprint, and deleted for the reason migration 15 gives: this
-                // is the table `kv` should have been, so the delete that `kv` could never have is
-                // the whole argument for the column. A state row surviving its agent would make a
-                // re-provisioned agent of the same name silently arrive switched off.
+                // is the table the removed `kv` should have been, so the delete that `kv` could
+                // never have is the whole argument for the column. A state row surviving its agent
+                // would make a re-provisioned agent of the same name silently arrive switched off.
                 q.agentStateDeleteAll.run(agentId)
+                // Its room memberships and who it was assigned to: an agent removed from the silo is no
+                // longer in any conversation, and a re-provisioned one of the same name starts unassigned.
+                conversations.purgeAgent(agentId)
                 scheduleQ.deleteAll.run(agentId)
                 return went
             })
@@ -2319,6 +2721,21 @@ export class SqliteStore implements Store {
             // Windows a leaked handle is an unopenable file next time.
             db.close()
             throw error
+        }
+    }
+
+    async snapshot(path: string): Promise<void> {
+        // A literal rather than a bound parameter: `VACUUM INTO` takes an expression, and binding it
+        // is not something every SQLite build this runs on agrees about.
+        this.#db.exec(`VACUUM INTO '${path.replaceAll("'", "''")}'`)
+        // The copy carries no leases (pilot.12). A restore is always a new process, and a
+        // lease naming the old one's pid read as held in the new container, where that number
+        // belongs to something else: the first boot after a restore was refused for 90 s.
+        const copy = await openDatabase({ path })
+        try {
+            copy.exec("DELETE FROM runtime_leases")
+        } finally {
+            copy.close()
         }
     }
 
@@ -2354,7 +2771,10 @@ interface UsageRow {
     readonly calls: number
     readonly prompt_tokens: number
     readonly cached_prompt_tokens: number
+    readonly cache_write_tokens: number
     readonly output_tokens: number
+    readonly images: number
+    readonly audio_seconds: number
     readonly estimated_calls: number
 }
 
@@ -2404,7 +2824,10 @@ function usageReport(
                 "COUNT(*) AS calls",
                 "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens",
                 "COALESCE(SUM(cached_prompt_tokens), 0) AS cached_prompt_tokens",
+                "COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens",
                 "COALESCE(SUM(output_tokens), 0) AS output_tokens",
+                "COALESCE(SUM(images), 0) AS images",
+                "COALESCE(SUM(audio_seconds), 0) AS audio_seconds",
                 "COALESCE(SUM(CASE WHEN prompt_reported = 0 OR output_reported = 0 THEN 1 ELSE 0 END), 0) AS estimated_calls",
             ].join(", ")}
                FROM model_calls ${clause(where)} ${groupBy}
@@ -2425,7 +2848,10 @@ function usageReport(
             calls: row.calls,
             promptTokens: row.prompt_tokens,
             cachedPromptTokens: row.cached_prompt_tokens,
+            cacheWriteTokens: row.cache_write_tokens,
             outputTokens: row.output_tokens,
+            images: row.images,
+            audioSeconds: row.audio_seconds,
             estimatedCalls: row.estimated_calls,
         }))
     return {

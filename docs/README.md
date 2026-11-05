@@ -24,9 +24,12 @@ VelaOps is its first consumer, not its owner.
 | `09-API-GUIDE.md` | The agent server walked through, `compose up` to a streamed reply. The *guide*; doc 04 is the contract. |
 | `12-OPENCLAW-CUTOVER.md` | Moving off the runtime this one replaces. |
 | `13-QA.md` | The manual QA pass before a release reaches anyone: upgrade, CLI, server, channels, API, control plane, numbers. |
+| `17-KUBERNETES.md` | Running the image on a cluster, and the volume-ownership trap. |
+| `22-PLAN-0.2.2.md` | 0.2.2: console, one conversation per person across surfaces, peer ask. |
+| `23-SPEC-SESSIONS.md` | `sessions.scope`, the owner's conversation and its rotation, and the `agents:<P>` memory pool. |
 
-`10-*.md` and `11-*.md` are private working documents (the business plan and the 0.2.0 plan) and
-are gitignored on purpose, which is why the numbering skips from 09 to 12. Anything they decide that
+`10`, `11`, `14`–`16` and `18`–`21` are private working documents (the business plan, the 0.2.0
+plan, VelaCrew's notes) and are gitignored on purpose, which is why the numbering has gaps. Anything they decide that
 the code depends on is recorded in `00-DECISIONS.md`, and a rule that exists only in a private file
 does not bind anybody reading this repo.
 
@@ -50,28 +53,27 @@ subsystems are only testable end-to-end.
 
 ## Status
 
-**Shipped: `dispach@0.1.3`.** Phases 0 through 19 are built, the last being the VelaOps cutover. This section named Phase 3 as the
+**Shipped: `dispach@0.2.0`.** Phases 0 through 19 are built, the last being the VelaOps cutover, and the 0.2.0 line on top of them. This section named Phase 3 as the
 frontier and "everything from Phase 4 on" as design-only for long enough to be actively misleading,
 which is the drift the closing paragraph below warns about — so it is now a pointer rather than a
 second copy of the plan:
 
-> **`05-PLAN.md` marks every phase `built` with the date it landed.** Read it there. A status
-> summary maintained by hand in a second file is a status summary that is right on the day it is
-> written, which is the whole lesson of the six phantom event rows in doc 04 and the
-> `packages/channel-whatsapp` that was listed in doc 01 and has never existed.
+> **`05-PLAN.md` marks every phase through 19 `built` with the date it landed.** The 0.2.0 work
+> after it is summarised in `CHANGELOG.md` and `developer-docs/runtime/whats-new-0-2-0.md`. Read it
+> there. A status summary maintained by hand in a second file is a status summary that is right on
+> the day it is written, which is the whole lesson of the six phantom event rows in doc 04 — and of
+> this section, which went on calling WhatsApp and the MCP provider unbuilt after both had shipped.
 
 In one paragraph: the manifest and loop, the store, both tool dialects, the tiered workspace, the
-system and web providers with a policy engine and a hardline floor, Telegram, the HTTP/SSE/WS
+system and web providers with a policy engine and a hardline floor, MCP as a tool provider
+(`packages/tools-mcp`, one provider among several per decision 4.7, never the substrate),
+Telegram and WhatsApp channels plus Slack, Teams and A2A (experimental in 0.2.0), the HTTP/SSE/WS
 server, an idempotent outbox, memory on FTS5, skills with two catalogues, the compaction ladder,
 phase scoping, scheduling, the plugin API with all four middleware wrap points, supervisor
 delegation, launchd services, the Docker image and compose front door, a typed client, scoped
-operator keys, the full-screen TUI, and a browser UI on the same origin as the API — which since
-0.1.1 edits settings and schedules rather than only reporting them.
-
-Not built: **WhatsApp**, which decision 8.4 makes a legal question rather than an engineering one,
-and which a plugin channel can now supply; and **MCP as a tool provider**, which decision 4.7 keeps
-as *one provider among several, never the substrate* — planned, not refused, and never written.
-`01-ARCHITECTURE.md` listed a `tools-mcp/` package in its tree for months; it has never existed.
+operator keys, the full-screen TUI, and a browser console on the same origin as the API — which
+since 0.2.2 covers models (Bedrock and fallbacks included), tools, schedules, usage, turns,
+files, people, rooms, actions, shared memory, webhooks and backups.
 
 Measured numbers live in `evals/`, each with a script to reproduce it.
 

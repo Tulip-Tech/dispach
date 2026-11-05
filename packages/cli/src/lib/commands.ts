@@ -103,6 +103,12 @@ export const COMMANDS: readonly CommandSpec[] = [
             { name: "model", kind: "string", placeholder: "id", help: "model id" },
             { name: "base-url", kind: "string", placeholder: "url", help: "endpoint base URL" },
             {
+                name: "region",
+                kind: "string",
+                placeholder: "aws-region",
+                help: "AWS region, with --preset bedrock (credentials come from the AWS chain)",
+            },
+            {
                 name: "api-key-env",
                 kind: "string",
                 placeholder: "VAR",
@@ -154,7 +160,7 @@ export const COMMANDS: readonly CommandSpec[] = [
                 name: "whatsapp",
                 kind: "string",
                 placeholder: "level",
-                help: "reachable on WhatsApp: none | connected — unofficial, and an opt-in plugin",
+                help: "reachable on WhatsApp: none | connected — unofficial, bundled with the binary",
                 defaultHelp: "none",
             },
             {
@@ -164,7 +170,7 @@ export const COMMANDS: readonly CommandSpec[] = [
                 name: "whatsapp-number",
                 kind: "string",
                 placeholder: "digits",
-                help: "whose number may message it — digits with no +, empty permits nobody",
+                help: "the account's own number to pair with (pairWith) — digits with no +; empty pairs by QR",
             },
             {
                 name: "server",
@@ -196,7 +202,7 @@ export const COMMANDS: readonly CommandSpec[] = [
                 kind: "string",
                 placeholder: "level",
                 help: "keep it running in the background: none | service",
-                defaultHelp: "none",
+                defaultHelp: "service",
             },
             {
                 name: "dir",
@@ -209,6 +215,11 @@ export const COMMANDS: readonly CommandSpec[] = [
                 name: "yes",
                 kind: "boolean",
                 help: "take every default; never ask, even at a terminal",
+            },
+            {
+                name: "measure-window",
+                kind: "boolean",
+                help: "ask the endpoint for the model's window and write it (the wizard always asks)",
             },
         ],
     },
@@ -473,6 +484,32 @@ export const COMMANDS: readonly CommandSpec[] = [
                 help: "skip the confirmation on an edit that weakens a check",
             },
         ],
+    },
+    {
+        // Who owns the agents on this machine (decisions 15.7, 15.14). `init` makes you the owner of
+        // what it creates; `adopt` does it for an agent that already existed. `hidden` for the reason
+        // `stop` is: adopting reloads the agent, which would be the one a session is attached to.
+        name: "owner",
+
+        inSession: "hidden",
+        needsServer: false,
+        summary: "show who owns this machine's agents, or make an existing agent yours",
+        args: [
+            {
+                name: "action",
+                required: true,
+                help: "what to do",
+                choices: [
+                    { value: "show", help: "print the owner id init minted for this sandbox" },
+                    {
+                        value: "adopt",
+                        help: "make an agent yours: assign it, recognise you on its channels, one conversation everywhere",
+                    },
+                ],
+            },
+            { ...MANIFEST, required: false },
+        ],
+        flags: [STORE, JSON_FLAG],
     },
     {
         name: "validate",
@@ -959,7 +996,7 @@ export const COMMANDS: readonly CommandSpec[] = [
                 kind: "string",
                 placeholder: "list",
                 help: "narrow it to these capabilities: read | chat | write | admin",
-                defaultHelp: "all four",
+                defaultHelp: "all of them",
             },
             {
                 name: "expires",

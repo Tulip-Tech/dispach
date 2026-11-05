@@ -1,9 +1,7 @@
 /**
- * `@dispach/channel-whatsapp` — WhatsApp through Baileys, as an **opt-in plugin**.
+ * `@dispach/channel-whatsapp` — WhatsApp through Baileys, bundled and **opt-in by configuration**.
  *
  * ```yaml
- * plugins:
- *   - "dispach-whatsapp"       # installed with `dispach plugins add <agent> <repo>`
  * channels:
  *   - type: whatsapp
  *     id: wa
@@ -17,14 +15,14 @@
  * pairing falls back to a QR.
  *
  *
- * ## Why this package is not in the binary
+ * ## Bundled, and nothing connects until a manifest names it
  *
  * **Baileys reverse-engineers WhatsApp Web, which WhatsApp's terms do not permit, and there is no
  * appeal path when a number is banned** — including during development. That is a risk an operator
  * takes deliberately for an account they chose; it is not one a runtime should take on behalf of
- * everybody who installs it. So the tarball and the container image carry none of this: it is
- * built, typechecked, linted and tested here, imported by nothing, and reaches an agent only
- * through `plugins add`.
+ * everybody who installs it. The code ships in the binary and the container image (registered in
+ * `packages/cli/src/lib/providers.ts`), so the opt-in is configuring the channel rather than
+ * obtaining the code: no socket opens to WhatsApp until `channels:` names `type: whatsapp`.
  *
  * **Pair a spare number.** Not advice — the recorded position (decision 8.4), and the reason this
  * sentence is in the package README as well as here.
@@ -34,16 +32,18 @@
  * One self-contained ES module. Baileys is bundled in — no runtime install, hard rule 5 — which is
  * what makes the same directory work in a checkout, under the npm install and in the container.
  * Three of Baileys' optional media dependencies stay external (`sharp`, `jimp`,
- * `link-preview-js`); it loads each inside a `catch` and this channel is text, so their absence
+ * `link-preview-js`); it loads each inside a `catch`, so their absence
  * costs image thumbnails and link previews and nothing else.
  */
 
 import { isAbsolute, resolve } from "node:path"
-// **Types only, and that is a rule rather than a preference.** A runtime import from `@dispach/core`
-// would be *bundled into this plugin* — a second copy of core inside the host that already has one,
-// which is decision 11.238's `instanceof` failure waiting to happen and 1.6 MB of duplicate code
-// measured. A plugin needs none of it: `setup` is handed everything it can use.
-import type { ChannelFactory, Plugin } from "@dispach/core"
+// **Types only — with one exception.** A runtime import from `@dispach/core` would be *bundled
+// into this plugin* — a second copy of core inside the host that already has one, which is
+// decision 11.238's `instanceof` failure waiting to happen and 1.6 MB of duplicate code
+// measured. The exception is `ConfigError`: a config refusal must arrive as itself (code, hint,
+// field), not wrapped in `channel_factory_failed`, and Telegram already imports it the same way
+// (issue #28).
+import { type ChannelFactory, ConfigError, type Plugin } from "@dispach/core"
 import { type BaileysApi, numberOf, WhatsAppTransport } from "./transport.ts"
 
 export type {
@@ -94,9 +94,12 @@ export const whatsappChannel: ChannelFactory = (context) => {
     const written = stringField(context.config, "pairWith")
     const pairWith = written === undefined ? undefined : written.replace(/[^0-9]/g, "")
     if (written !== undefined && !/^[0-9]{6,20}$/.test(pairWith ?? ""))
-        throw new Error(
-            `channels.${context.id}.pairWith: "${written}" is not a WhatsApp number — the digits with the country code, with or without a +.`,
-        )
+        throw new ConfigError({
+            code: "whatsapp_pair_with_invalid",
+            message: `Channel "${context.id}" has a pairWith that is not a WhatsApp number: "${written}".`,
+            hint: "Write the digits with the country code, with or without a + (for example +8801711223344 or 8801711223344); spaces and dashes are normalised away. The agent still starts — a channel is optional, so this one is reported broken rather than blocking the load.",
+            field: `channels[${context.id}].pairWith`,
+        })
 
     /**
      * The bracket of the Linked-devices label. Printable ASCII and short, because it goes into a
@@ -106,9 +109,12 @@ export const whatsappChannel: ChannelFactory = (context) => {
      */
     const deviceName = stringField(context.config, "deviceName")
     if (deviceName !== undefined && !/^[\x20-\x7e]{1,32}$/.test(deviceName))
-        throw new Error(
-            `channels.${context.id}.deviceName: "${deviceName}" must be 1-32 printable ASCII characters — it is the bracket of the phone's Linked-devices label.`,
-        )
+        throw new ConfigError({
+            code: "whatsapp_device_name_invalid",
+            message: `Channel "${context.id}" has a deviceName outside 1-32 printable ASCII characters: "${deviceName}".`,
+            hint: "The deviceName is the bracket of the phone's Linked-devices label, so WhatsApp validates it: keep it 1-32 printable ASCII characters (letters, digits, spaces, punctuation). The agent still starts — a channel is optional, so this one is reported broken rather than blocking the load.",
+            field: `channels[${context.id}].deviceName`,
+        })
 
     const pairingDelayMs = context.config.pairingDelayMs
     return new WhatsAppTransport({
@@ -165,7 +171,7 @@ export const VERSION = "0.1.0"
 export default {
     name: "whatsapp",
     version: VERSION,
-    dispachApi: "^0.1",
+    dispachApi: "^0.2",
     permissions: [
         // Baileys talks to WhatsApp's own infrastructure. The hosts are the ones it dials; they are
         // recorded because `permissions` is the vocabulary decision 7.5 promised, and advisory

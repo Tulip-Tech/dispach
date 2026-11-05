@@ -129,13 +129,27 @@ writeFileSync(VERSION_TS, versionTs.replace(`VERSION = "${pkg.version}"`, `VERSI
 // The lockfile records workspace versions.
 run("bun", ["install"])
 
+// Every copy of the version in the README and the docs comes from the package just written.
+run("bun", ["scripts/facts.ts"])
+
 process.stdout.write(`\n  ${pkg.version} → ${version}\n`)
 process.stdout.write(
-    "    packages/cli/package.json\n    packages/core/src/version.ts\n    CHANGELOG.md\n    bun.lock\n",
+    "    packages/cli/package.json\n    packages/core/src/version.ts\n    CHANGELOG.md\n    bun.lock\n    developer-docs/reference/openapi.json\n    every fact copy (scripts/facts.ts)\n",
 )
 
 if (!argv.includes("--no-gate")) {
-    for (const step of ["build", "test", "typecheck", "lint", "verify:package"]) {
+    // `docs:generate` follows `build` because the API reference carries the version and is exported
+    // through the server's built copy of core: regenerated before the build, it is stamped with the old
+    // version and `docs:check` fails.
+    for (const step of [
+        "build",
+        "docs:generate",
+        "test",
+        "typecheck",
+        "lint",
+        "docs:check",
+        "verify:package",
+    ]) {
         process.stdout.write(`\n  bun run ${step}\n`)
         const result = Bun.spawnSync(["bun", "run", step], {
             cwd: ROOT,
@@ -154,7 +168,7 @@ if (!argv.includes("--no-gate")) {
 process.stdout.write(`
   Review the diff, then:
 
-    git add -A && git commit -m "release: ${version}"
+    git add -A && git commit -m "chore(release): ${version}"
     git tag -a v${version} -m "v${version}"
     git push && git push origin v${version}
 

@@ -32,6 +32,7 @@ import {
     endNote,
     passThroughFilter,
     type StreamFilter,
+    SUBMIT_ARTIFACT,
 } from "@dispach/core/wire"
 
 export type Row =
@@ -60,6 +61,19 @@ export type Row =
            * output can be anything. The text is in the stored session, on the reattach path.
            */
           readonly untrusted?: boolean
+          /**
+           * The arguments and the first 2 KB of the output, **only** under the agent's
+           * `tools.eventDetail: redacted`, which puts them on the events with credentials replaced.
+           * Absent otherwise, which is the default and the reason above.
+           */
+          readonly args?: Readonly<Record<string, unknown>>
+          readonly output?: string
+          readonly outputTruncated?: boolean
+          /**
+           * The subagents this call ran, folded under this row: one for a routed call (pilot.6), one
+           * per task for `delegate` (decision 15.20), in task order.
+           */
+          readonly subagents?: readonly SubagentBlock[]
       }
     | {
           readonly kind: "approval"
@@ -72,6 +86,25 @@ export type Row =
       }
     /** How the turn ended, and anything the runtime wanted a person to read. */
     | { readonly kind: "note"; readonly id: string; readonly text: string; readonly bad: boolean }
+
+export interface SubagentBlock {
+    readonly name: string
+    /** A `delegate` task's label and position in its call. Absent for a routed call. */
+    readonly label?: string
+    readonly index?: number
+    /** The child's own session, which is how its events find this row. */
+    readonly sessionKey: string
+    readonly calls: readonly {
+        readonly callId: string
+        readonly slug: string
+        readonly ok?: boolean
+        readonly latencyMs?: number
+    }[]
+    /** Set when the child finishes: `ok`, `no_artifact`, `budget` or `error`. */
+    readonly outcome?: string
+    readonly steps?: number
+    readonly tokens?: number
+}
 
 export interface Transcript {
     /**
@@ -173,8 +206,105 @@ export function reduce(state: Transcript, item: TurnStreamItem): Transcript {
     }
 }
 
+/**
+ * The tool row `match` picks, with its block for `sessionKey` changed or added. Unchanged when no row
+ * matches or `change` declines.
+ */
+function withBlock(
+    state: Transcript,
+    match: (row: Extract<Row, { kind: "tool" }>) => boolean,
+    sessionKey: string,
+    change: (block: SubagentBlock | undefined) => SubagentBlock | undefined,
+): Transcript {
+    const index = state.rows.findIndex((row) => row.kind === "tool" && match(row))
+    const row = state.rows[index]
+    if (row === undefined || row.kind !== "tool") return state
+    const blocks = row.subagents ?? []
+    const at = blocks.findIndex((block) => block.sessionKey === sessionKey)
+    const block = change(at === -1 ? undefined : blocks[at])
+    if (block === undefined) return state
+    const next =
+        at === -1
+            ? [...blocks, block].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+            : blocks.map((existing, i) => (i === at ? block : existing))
+    const rows = [...state.rows]
+    rows[index] = { ...row, subagents: next }
+    return { ...state, rows }
+}
+
+/** The row holding the subagent whose session is `sessionKey`. */
+const holds = (sessionKey: string) => (row: Extract<Row, { kind: "tool" }>) =>
+    row.subagents?.some((block) => block.sessionKey === sessionKey) === true
+
+/**
+ * A subagent's own event, which a stream carries only when asked (`children: true`). Its calls go
+ * under the row that ran it; its text, steps and `turn.end` are its own turn's and touch nothing here.
+ */
+function onChild(state: Transcript, event: AnyEvent): Transcript {
+    const key = event.sessionKey ?? ""
+    // The child's return channel is how it hands back its answer, not work it did for the person.
+    if ((event.data as { readonly slug?: string }).slug === SUBMIT_ARTIFACT) return state
+    if (event.type === "tool.call") {
+        const data = event.data as EventDataMap["tool.call"]
+        return withBlock(state, holds(key), key, (block) =>
+            block === undefined
+                ? undefined
+                : { ...block, calls: [...block.calls, { callId: data.callId, slug: data.slug }] },
+        )
+    }
+    if (event.type === "tool.result") {
+        const data = event.data as EventDataMap["tool.result"]
+        return withBlock(state, holds(key), key, (block) =>
+            block === undefined
+                ? undefined
+                : {
+                      ...block,
+                      calls: block.calls.map((call) =>
+                          call.callId === data.callId
+                              ? { ...call, ok: data.ok, latencyMs: data.latencyMs }
+                              : call,
+                      ),
+                  },
+        )
+    }
+    return state
+}
+
 function onEvent(state: Transcript, event: AnyEvent): Transcript {
+    if (event.parentTurnId !== undefined) return onChild(state, event)
     switch (event.type) {
+        case "handoff.start": {
+            const data = event.data as EventDataMap["handoff.start"]
+            if (data.kind !== "self" || data.callId === undefined) return state
+            return withBlock(
+                state,
+                (row) => row.callId === data.callId,
+                data.sessionKey,
+                (block) =>
+                    block ?? {
+                        name: data.name ?? "subagent",
+                        sessionKey: data.sessionKey,
+                        calls: [],
+                        ...(data.label === undefined ? {} : { label: data.label }),
+                        ...(data.index === undefined ? {} : { index: data.index }),
+                    },
+            )
+        }
+
+        case "handoff.result": {
+            const data = event.data as EventDataMap["handoff.result"]
+            return withBlock(state, holds(data.sessionKey), data.sessionKey, (block) =>
+                block === undefined
+                    ? undefined
+                    : {
+                          ...block,
+                          outcome: data.outcome,
+                          steps: data.steps,
+                          tokens: data.tokens.prompt + data.tokens.output,
+                      },
+            )
+        }
+
         case "turn.start":
             return { ...state, running: true }
 
@@ -234,6 +364,7 @@ function onEvent(state: Transcript, event: AnyEvent): Transcript {
                         callId: data.callId,
                         slug: data.slug,
                         mutating: data.mutating,
+                        ...(data.args === undefined ? {} : { args: data.args }),
                     },
                 ],
             }
@@ -263,6 +394,8 @@ function onEvent(state: Transcript, event: AnyEvent): Transcript {
                 truncated: data.truncated,
                 latencyMs: data.latencyMs,
                 ...(data.trust === "untrusted" ? { untrusted: true } : {}),
+                ...(data.output === undefined ? {} : { output: data.output }),
+                ...(data.outputTruncated === true ? { outputTruncated: true } : {}),
             }
             return { ...state, rows }
         }

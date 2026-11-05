@@ -12,22 +12,37 @@
  * why `TurnStreams` exists — a client that comes back has to be able to find out what it missed.
  */
 
-import { readFile } from "node:fs/promises"
-import type { Capability as Cap, KeyScope } from "@dispach/core"
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { basename, dirname, join, relative, resolve as resolvePath, sep } from "node:path"
+import type { Capability as Cap, KeyScope, ReloadOutcome, Setting } from "@dispach/core"
 import {
     type Agent,
+    AgentManifestSchema,
     type AgentStateRecord,
     type AnyEvent,
+    agentOf,
+    bundleSections,
+    type ConversationRecord,
     type ErrorDetail,
     EVENT_TYPES,
-    editManifest,
+    editManifestChanges,
     entryPhase,
+    exportBundle,
+    formatSessionKey,
     HarnessError,
+    type ImageInput,
+    importBundle,
     isHarnessError,
+    isHead,
     isPhased,
+    jitterFor,
     keyFingerprint,
     keyLabelProblem,
     MAX_KEY_LABEL,
+    type MountedRoute,
+    manifestDocument,
     manifestValueAt,
     nearest,
     newKeyId,
@@ -35,15 +50,22 @@ import {
     newRunId,
     newTurnId,
     newWebhookSecret,
+    nextCron,
     PERSON_SETTABLE_PATHS,
+    type PluginCaller,
+    parseSchedule,
     parseSettingValue,
+    personSetting,
     phasesFor,
+    planWorkspace,
     prepareScheduleWrite,
     type Runtime,
+    readImages,
     type ScheduleRecord,
     SENDER_KINDS,
     SETTINGS,
     type SenderKind,
+    scheduleSendOptions,
     scheduleSessionKey,
     settingByPath,
     type TurnRecord,
@@ -71,29 +93,59 @@ import {
     isScoped,
     type Principal,
     reachesAgent,
+    reachesEventSession,
     reachesSession,
     scopeFilter,
+    senderFor,
+    sessionFor,
 } from "./principal.ts"
 import { claimSpent, fail, forbidden } from "./respond.ts"
 import { Router } from "./router.ts"
 import { sseResponse } from "./sse.ts"
+import { type TarEntry, tarGz } from "./tar.ts"
 import { serveAsset, WEB_PATHS } from "./web.ts"
 import {
     ApprovalBody,
+    AssigneeBody,
     ChannelPatchBody,
+    CompactBody,
     ConfigBody,
+    ConversationBody,
+    ConversationMessageBody,
+    DecisionBody,
+    DeliveryBody,
+    ImportBody,
     KeyBody,
+    MembersBody,
     MessageBody,
+    NoteBody,
+    ParticipantBody,
     PhaseBody,
+    PresenceBody,
+    ProjectBody,
     ProvisionBody,
     parseBody,
+    RecallBody,
+    ResolveBody,
+    RotateBody,
     SecretsBody,
+    SpaceWriterBody,
     StopBody,
+    ToolsRefreshBody,
+    VarsBody,
     WebhookBody,
+    WorkspaceFileBody,
 } from "./wire-schemas.ts"
 
 /** Bodies larger than this are refused before a channel plugin sees them. */
 const MAX_BODY_BYTES = 1_000_000
+
+/**
+ * An agent bundle's cap (R11): memory and knowledge are markdown, and a year of notes is well under
+ * this. Its own number because a bundle is not a message, and raising the shared cap for it would
+ * raise it for every route a stranger's channel can reach.
+ */
+const MAX_BUNDLE_BYTES = 25_000_000
 
 /**
  * Caps on the sender fields and the idempotency key.
@@ -223,6 +275,14 @@ export interface HandlerOptions {
      */
     readonly channels?: ChannelAdmin
     /**
+     * What the CLI injects for `DELETE /v1/agents/:id`. Absent answers `501`.
+     *
+     * Injected because where an agent's files are, and whether they may be deleted, is the CLI's
+     * knowledge: only an agent inside the sandbox is ever deleted, and never one whose id another
+     * directory also declares — that delete would take the other agent's conversations with it.
+     */
+    readonly remover?: AgentRemover
+    /**
      * What the CLI injects for `GET` and `PUT /v1/agents/:id/secrets`. Absent answers `501`.
      *
      * Injected for `channels`' reason: the values go into the `.env` beside the manifest, and how is
@@ -230,6 +290,11 @@ export interface HandlerOptions {
      * the caller, which is the rule `setCredential` states for one channel, applied to the whole agent.
      */
     readonly secrets?: SecretAdmin
+    /**
+     * The state directory `serve` runs from (`~/.dispach`), for `GET /v1/backup?include=home`
+     * (pilot.11). Absent, that include is refused: what lives beside the store is the CLI's layout.
+     */
+    readonly home?: string
 }
 
 /** What the CLI injects for the secrets routes. See `HandlerOptions.secrets`. */
@@ -278,6 +343,18 @@ export interface ChannelAdmin {
     unpair(manifestPath: string, channelId: string): { readonly note: string }
 }
 
+/** What the CLI injects for `DELETE /v1/agents/:id`. See `HandlerOptions.remover`. */
+export interface AgentRemover {
+    /** The agent's directory, or why it may not be deleted. Deletes nothing. */
+    locate(
+        agentId: string,
+    ):
+        | { readonly ok: true; readonly dir: string }
+        | { readonly ok: false; readonly error: ErrorDetail; readonly status: 404 | 409 }
+    /** Delete the directory. Called last, after the agent is gone and its rows are purged. */
+    deleteDir(dir: string): Promise<void>
+}
+
 /** What the CLI injects for `POST /v1/agents`. See `HandlerOptions.provision`. */
 export interface Provisioner {
     /** Every question, in asking order, with defaults and choices. Served as-is. */
@@ -295,6 +372,13 @@ export interface Provisioner {
         readonly dir: string
         readonly files: readonly string[]
     }
+    /**
+     * Make the sandbox's owner the owner of an agent `create` just wrote, before it is adopted
+     * (decision 15.7): `create` writes `sessions.scope: owner`, which needs somebody to be the owner.
+     * Optional, so an embedder's provisioner without one still compiles; a template's agent is never
+     * claimed, since its manifest is the operator's.
+     */
+    claim?(manifestPath: string): Promise<void>
     /** Every template in this server's sandbox, with its variables. A broken one carries `problem`. */
     templates(): readonly TemplateWire[]
     /** Create an agent from a template. Throws a `HarnessError`, as `create` does. */
@@ -303,6 +387,26 @@ export interface Provisioner {
         readonly name: string
         readonly vars: Readonly<Record<string, string>>
     }): ReturnType<Provisioner["create"]>
+    /**
+     * Apply changed vars to an agent made from a template (pilot.5): only files nobody edited since
+     * they were rendered are rewritten. Optional, so an embedder's provisioner without it still
+     * compiles; the route then answers 501.
+     */
+    rerender?(input: {
+        readonly agentDir: string
+        readonly vars: Readonly<Record<string, string>>
+    }): {
+        readonly rendered: readonly string[]
+        readonly skipped: readonly { readonly file: string; readonly reason: string }[]
+        readonly undo: () => void
+    }
+    /**
+     * Which template an agent was made from and the plain values it was last rendered with: the read
+     * half of `rerender`. Undefined for an agent with no template record. Secrets are never in it.
+     */
+    templateOf?(
+        agentDir: string,
+    ): { readonly template: string; readonly vars: Readonly<Record<string, string>> } | undefined
 }
 
 /** One template as the wire carries it. Structural, so `packages/cli` needs no import from here. */
@@ -418,6 +522,15 @@ const DOCS_PAGE = `<!doctype html>
 export type ServerHandler = ((request: Request) => Promise<Response>) & {
     /** Resolve a credential without dispatching. `Response` is a refusal. */
     readonly authenticate: (request: Request) => Promise<Principal | Response>
+    /**
+     * The route table, without handlers — what `test/harness.ts` matches a response to, so its
+     * check of every declared response body uses this router's own matching and order.
+     */
+    readonly routes: () => readonly {
+        readonly method: string
+        readonly pattern: string
+        readonly capability: Cap | "open"
+    }[]
 }
 
 export function createHandler(options: HandlerOptions): ServerHandler {
@@ -621,6 +734,10 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "/v1/ready",
         () => {
             if (runtime.ready) return json({ status: "ready", agents: runtime.list().length })
+            // A drain is the way down, not the way up: `"starting"` would read as a boot to wait for.
+            if (runtime.draining) {
+                return json({ status: "draining", agents: runtime.list().length }, 503)
+            }
             // `"starting"`, not `"stopped"`. A runtime that has not reached readiness is on its way up,
             // and "stopped" is what an orchestrator reads as "give up on this container". The
             // `pending: []` this used to carry was a promise nothing filled: agents load inside
@@ -681,25 +798,29 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      * make a listing depend on credentials being present — the defect `readManifestHeader` exists
      * to avoid. The id and the reason are what a client can act on.
      *
-     * `GET /v1/agents/:id` still answers **404** for one of these, and the asymmetry is the point:
-     * the listing answers "what exists", the resource answers "what is running". A 200 there would
-     * have to invent a body for an agent with no tools, no window and no sessions in memory.
+     * `GET /v1/agents/:id` answers the same thin row for one of these since pilot.5. It used to
+     * answer 404, so a client holding an id saw the listing call it `disabled` and the resource call
+     * it nonexistent (a pilot). Every route that *acts* on the agent still answers 404: the row says
+     * what exists, and nothing pretends it is running.
      */
     router.add(
         "GET",
         "/v1/agents",
         async (context) => {
-            const hosted = runtime.list().map((agent) => summary(runtime, agent))
+            // Who each agent is assigned to, so the control plane's relay can list a person's peers
+            // without a request per agent (`24-SPEC-PEER-ASK.md`). `null` is a shared agent.
+            const hosted = await Promise.all(
+                runtime.list().map(async (agent) => ({
+                    ...summary(runtime, agent),
+                    assignee:
+                        (await runtime.store.conversations.assignment(agent.id))?.participantId ??
+                        null,
+                })),
+            )
             const live = new Set(hosted.map((entry) => entry.id))
             const stopped = (await runtime.store.agentState.list())
                 .filter((state) => !state.enabled && !live.has(state.agentId))
-                .map((state) => ({
-                    id: state.agentId,
-                    name: state.agentId,
-                    status: "disabled" as const,
-                    ...(state.reason === undefined ? {} : { reason: state.reason }),
-                    ...(state.disabledAt === undefined ? {} : { disabledAt: state.disabledAt }),
-                }))
+                .map(stoppedRow)
             /**
              * **Filtered by scope, and the stopped rows with it.**
              *
@@ -718,8 +839,27 @@ export function createHandler(options: HandlerOptions): ServerHandler {
     router.add(
         "GET",
         "/v1/agents/:id",
-        (context) =>
-            withAgent(runtime, context, async (agent) => {
+        async (context) => {
+            const id = context.params.id ?? ""
+            if (
+                !runtime.list().some((agent) => agent.id === id) &&
+                reachesAgent(context.principal, id)
+            ) {
+                const state = await runtime.store.agentState.get(id)
+                if (state !== undefined && !state.enabled) return json(stoppedRow(state))
+                // On disk and not running (pilot.15): say why rather than answer 404, which left an
+                // agent that failed to load with no way to find out over the API what was wrong.
+                const file = options.resolveAgent?.(id)
+                if (file !== undefined) {
+                    const error = await runtime.diagnose(file)
+                    return json({
+                        id,
+                        status: error === undefined ? "not_running" : "failed",
+                        ...(error === undefined ? {} : { error }),
+                    })
+                }
+            }
+            return withAgent(runtime, context, async (agent) => {
                 // Both of these were the literal `0`, for every agent, whatever was configured — and
                 // the spec advertises them as "tool count, skills indexed, schedule count". A number
                 // that is always zero is worse than an absent field: it reads as a measurement.
@@ -732,10 +872,29 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 // says which is which.
                 const schedules = await agent.store.schedules.list(agent.id)
                 const team = runtime.team(agent.id)
+                // Who it works for, when an admin recorded it (Phase 27): the person accountable for
+                // what it is asked to do.
+                const assignment = await runtime.store.conversations.assignment(agent.id)
+                const peers = await runtime.askPeers(agent.id)
                 return json({
                     ...summary(runtime, agent),
+                    ...(assignment === undefined
+                        ? {}
+                        : {
+                              assignedTo: {
+                                  participantId: assignment.participantId,
+                                  ...(assignment.assignedBy === undefined
+                                      ? {}
+                                      : { assignedBy: assignment.assignedBy }),
+                                  assignedAt: assignment.assignedAt,
+                              },
+                          }),
                     dialect: agent.describe().dialect,
                     window: agent.window,
+                    // The main model's capabilities as resolved: the registry's row for its id, with
+                    // the manifest's overrides laid over. A form that offers an override has to show
+                    // what it overrides, and the registry lives here, not in the browser.
+                    capabilities: agent.roles.main.capabilities,
                     tools: agent.tools.size,
                     // What the catalogue costs every turn, beside how many tools there are. A count
                     // says nothing about the bill: eight system tools and eight Composio ones differ
@@ -743,6 +902,9 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                     catalogueTokens: agent.describe().catalogueTokens,
                     skills: agent.skills?.skills.length ?? 0,
                     schedules: schedules.length,
+                    // Whom `ask_agent` can ask (`24-SPEC-PEER-ASK.md`). Absent when nobody, like
+                    // `team`.
+                    ...(peers.length === 0 ? {} : { peers }),
                     /**
                      * Who this agent delegates to.
                      *
@@ -766,7 +928,8 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                           }),
                     warnings: [...agent.warnings, ...agent.tools.warnings],
                 })
-            }),
+            })
+        },
         { capability: "read" },
     )
 
@@ -788,20 +951,492 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      * not this route's: a reload that killed somebody's half-finished answer to pick up a setting
      * would be a worse trade than waiting. `agent_turn_in_flight` names the count.
      */
+    /**
+     * A slice of one agent, out and in (doc 16 R11): its memory and knowledge, as a JSON bundle. The
+     * embedder brokers it — scans for secrets, decides who may — so both are `admin`, and a key bound
+     * to a participant must be an admin participant's.
+     */
+    /**
+     * The silo, backed up (pilot.9): a consistent snapshot of
+     * the store and every hosted agent's directory, as one tar.gz.
+     *
+     * `admin`, and every agent's data is in it, so a key scoped to fewer agents is refused rather than
+     * handed a partial backup that looks whole. `.env` files are left out on purpose: secrets belong
+     * to the embedder that injects them, and a backup is a file that gets copied around. So are
+     * `.venv`, `node_modules` and `.git`, which are rebuilt rather than restored.
+     */
+    router.add(
+        "GET",
+        "/v1/backup",
+        async (context) => {
+            if (context.principal.kind === "key" && context.principal.scope?.agents !== undefined) {
+                return fail(
+                    {
+                        code: "backup_requires_unscoped_key",
+                        message:
+                            "This key reaches only some agents, and a backup holds every agent's data.",
+                        hint: "Take backups with a key that has admin and no agents scope.",
+                    },
+                    403,
+                )
+            }
+            // `?include=env,git` (pilot.10): a backup somebody restores from needs the channel
+            // tokens and a workspace's git history, and they asked for it in so many words. Opt-in, so
+            // a backup taken the way it always was still carries no secret.
+            const include = (context.url.searchParams.get("include") ?? "")
+                .split(",")
+                .map((part) => part.trim())
+                .filter((part) => part !== "")
+            const unknown = include.filter(
+                (part) => part !== "home" && !Object.hasOwn(BACKUP_INCLUDE, part),
+            )
+            if (unknown.length > 0) {
+                return fail(
+                    {
+                        code: "backup_include_invalid",
+                        message: `include names ${unknown.join(", ")}, which a backup cannot add.`,
+                        hint: `Accepted: ${[...Object.keys(BACKUP_INCLUDE), "home"].join(", ")}, comma-separated. env adds each agent's .env (its secrets), git its .git directories, home everything else in the state directory.`,
+                        field: "include",
+                    },
+                    400,
+                )
+            }
+            const home = options.home
+            if (include.includes("home") && home === undefined) {
+                return fail(
+                    {
+                        code: "backup_home_unavailable",
+                        message:
+                            "include=home asks for the state directory, and this server was not given one.",
+                        hint: "`serve` passes it; a handler embedded elsewhere sets HandlerOptions.home. The store and agent directories are backed up without it.",
+                        field: "include",
+                    },
+                    400,
+                )
+            }
+            const skip = new Set(BACKUP_SKIP)
+            for (const part of include)
+                for (const name of BACKUP_INCLUDE[part] ?? []) skip.delete(name)
+            const dir = await mkdtemp(join(tmpdir(), "backup-"))
+            const snapshot = join(dir, "store.db")
+            await runtime.store.snapshot(snapshot)
+            const entries: TarEntry[] = [{ name: "store.db", source: { path: snapshot } }]
+            const agents: { id: string; dir: string; files: number }[] = []
+            for (const agent of runtime.list()) {
+                // ponytail: every file is read into memory before the stream starts; stream from disk
+                // if a .git grows past what a backup request should hold.
+                const files = await agentFiles(agent.dir, skip)
+                for (const file of files) {
+                    entries.push({
+                        name: `agents/${agent.id}/${file.name}`,
+                        source: { bytes: await readFile(file.path) },
+                    })
+                }
+                // Where it lived, so a restore puts `agents/<id>/` back in the right directory.
+                agents.push({ id: agent.id, dir: agent.dir, files: files.length })
+            }
+            // `include=home` (pilot.11): the rest of the state directory under `home/`, so a team
+            // drive, its git directory, templates and stopped agents are restorable too. Hosted agents
+            // are already under `agents/`; the store is the snapshot above, never its live files;
+            // logs and the skill-source clones are rebuilt rather than restored.
+            let homeFiles: number | undefined
+            if (include.includes("home") && home !== undefined) {
+                const hosted = new Set(runtime.list().map((agent) => resolvePath(agent.dir)))
+                const at = (...parts: string[]) => resolvePath(home, ...parts)
+                const prune = new Set([
+                    ...hosted,
+                    at("logs"),
+                    at("sources"),
+                    ...["", "-wal", "-shm", "-journal"].map((suffix) => at(`store.db${suffix}`)),
+                ])
+                const files = await agentFiles(home, skip, prune)
+                for (const file of files)
+                    entries.push({ name: `home/${file.name}`, source: { path: file.path } })
+                homeFiles = files.length
+            }
+            const manifest = {
+                createdAt: new Date().toISOString(),
+                version: VERSION,
+                agents,
+                included: include,
+                ...(homeFiles === undefined ? {} : { home: { dir: home, files: homeFiles } }),
+                excluded: [...skip],
+            }
+            entries.unshift({
+                name: "backup.json",
+                source: {
+                    bytes: new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`),
+                },
+            })
+            const stamp = manifest.createdAt.replace(/[:.]/g, "-")
+            return new Response(
+                tarGz(entries, () => rm(dir, { recursive: true, force: true })),
+                {
+                    headers: {
+                        "content-type": "application/gzip",
+                        "content-disposition": `attachment; filename="backup-${stamp}.tar.gz"`,
+                    },
+                },
+            )
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/agents/:id/export",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const refusal = await requireAdminParticipant(context.principal)
+                if (refusal !== undefined) return refusal
+                const paths = context.url.searchParams.get("paths")
+                try {
+                    const sections = bundleSections(
+                        paths === null ? undefined : paths.split(",").map((p) => p.trim()),
+                    )
+                    return json(exportBundle(agent, sections))
+                } catch (error) {
+                    return refusedBy(error)
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    router.add(
+        "POST",
+        "/v1/agents/:id/import",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const refusal = await requireAdminParticipant(context.principal)
+                if (refusal !== undefined) return refusal
+                const body = await readJson(context.request, MAX_BUNDLE_BYTES)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(ImportBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                try {
+                    const report = await importBundle({
+                        agent,
+                        bundle: parsed.value.bundle,
+                        ...(parsed.value.mode === undefined ? {} : { mode: parsed.value.mode }),
+                        reload: async () => (await runtime.reload(agent.id)).status,
+                    })
+                    return json({ id: agent.id, ...report })
+                } catch (error) {
+                    return refusedBy(error)
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    /**
+     * Re-render an agent's template files with changed vars (pilot.5), then reload it.
+     *
+     * The engine rewrote persona files through `docker exec` and reloaded. Here the template's own
+     * renderer does it, and a file somebody edited since it was rendered is left alone and reported,
+     * which a rewrite from outside could not tell. If the agent refuses to load afterwards, every
+     * rewritten file is put back, so a bad value cannot leave an agent that will not start.
+     * Gated like provisioning, because it writes the agent's files.
+     */
+    /**
+     * The vars an agent was made with, so a form can show what a `PATCH` would change. The values
+     * are the plain ones `rerender` keeps on record; a secret var is declared by the template and
+     * never has a value here, because it lives in `.env`.
+     */
+    router.add(
+        "GET",
+        "/v1/agents/:id/vars",
+        (context) =>
+            withTarget(runtime, options, context, async (target) => {
+                const templateOf = options.provision?.templateOf
+                if (templateOf === undefined) {
+                    return fail(
+                        {
+                            code: "rerender_not_supported",
+                            message: "This server cannot read an agent's template record.",
+                            hint: "`serve` provides it; an embedder mounting this handler has no templates directory.",
+                        },
+                        501,
+                    )
+                }
+                const record = templateOf(target.agent?.dir ?? dirname(target.file ?? ""))
+                if (record === undefined) {
+                    return fail(
+                        {
+                            code: "agent_not_from_template",
+                            message: "This agent has no record of the template it was made from.",
+                            hint: "Only an agent created with POST /v1/agents {template} on 0.2.0 or later carries one. Edit its files directly instead.",
+                        },
+                        409,
+                    )
+                }
+                return json({ id: target.id, template: record.template, vars: record.vars })
+            }),
+        { capability: "admin" },
+    )
+    router.add(
+        "PATCH",
+        "/v1/agents/:id/vars",
+        (context) =>
+            withTarget(runtime, options, context, async (target) => {
+                const rerender = options.provision?.rerender
+                if (rerender === undefined) {
+                    return fail(
+                        {
+                            code: "rerender_not_supported",
+                            message: "This server cannot re-render an agent's template.",
+                            hint: "`serve` provides it; an embedder mounting this handler has no templates directory. Edit the files and POST /reload instead.",
+                        },
+                        501,
+                    )
+                }
+                if (!mayProvision(context.principal)) {
+                    return fail(
+                        {
+                            code: "provisioning_not_local",
+                            message:
+                                "Re-rendering an agent's files needs either a loopback bind or a credential with the admin capability.",
+                            hint: "It writes the agent's files, like creating one. Present the server's token or an operator key minted with `can: [admin]`.",
+                        },
+                        403,
+                    )
+                }
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(VarsBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+
+                let result: ReturnType<NonNullable<Provisioner["rerender"]>>
+                try {
+                    result = rerender({
+                        agentDir: target.agent?.dir ?? dirname(target.file ?? ""),
+                        vars: parsed.value.vars,
+                    })
+                } catch (error) {
+                    if (isHarnessError(error)) {
+                        return fail(
+                            error.toDetail(),
+                            error.code === "agent_not_from_template" ? 409 : 400,
+                        )
+                    }
+                    throw error
+                }
+                const respond = (reload: "none" | "loaded" | "pending", status = 200) =>
+                    json(
+                        {
+                            id: target.id,
+                            rendered: result.rendered,
+                            skipped: result.skipped,
+                            reload,
+                        },
+                        status,
+                    )
+                if (result.rendered.length === 0) return respond("none")
+                // Not running (pilot.15): re-rendering the template is how a template change that
+                // broke the agent is undone, and `POST /start` loads the result.
+                if (target.agent === undefined) return respond("none")
+                try {
+                    const outcome = await runtime.reload(target.id)
+                    return respond(outcome.status, outcome.status === "pending" ? 202 : 200)
+                } catch (error) {
+                    result.undo()
+                    if (isHarnessError(error)) return fail(error.toDetail(), 400)
+                    throw error
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    /**
+     * Replace one of the agent's workspace files (pilot.15): only a file its manifest
+     * declares (a tier list, `context.files`, or the soul), so this cannot write anywhere else. A
+     * running agent is reloaded and, if the file makes it refuse to load, the old text is put back
+     * and the reason returned. An agent that is not running gets the file and a diagnosis, so a repair
+     * can take several writes before `POST /start`. `admin`: it changes the agent's instructions.
+     */
+    /**
+     * The files the agent's prompt is built from, and one file's text — the read half of the
+     * `PUT` below, so an editor can show what it is about to replace. Same declaration logic, so
+     * the two cannot disagree about which files exist.
+     */
+    router.add(
+        "GET",
+        "/v1/agents/:id/workspace",
+        (context) =>
+            withTarget(runtime, options, context, async (target) => {
+                const manifest = target.file
+                if (manifest === undefined) return json({ id: target.id, files: [] })
+                const named = await declaredWorkspace(target.id, manifest)
+                if (named instanceof Response) return named
+                return json({
+                    id: target.id,
+                    files: named.declared.map((ref) => ({
+                        name: basename(ref.path),
+                        tier: ref.tier,
+                        field: ref.field,
+                        exists: existsSync(ref.path),
+                        bytes: existsSync(ref.path) ? statSync(ref.path).size : 0,
+                    })),
+                })
+            }),
+        { capability: "admin" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/agents/:id/workspace/:file",
+        (context) =>
+            withTarget(runtime, options, context, async (target) => {
+                const manifest = target.file
+                const name = context.params.file ?? ""
+                if (manifest === undefined) return unknownWorkspaceFile(target.id, name, [])
+                const named = await declaredWorkspace(target.id, manifest)
+                if (named instanceof Response) return named
+                const path = findDeclared(named.declared, named.workspaceDir, name)
+                if (path === undefined) return unknownWorkspaceFile(target.id, name, named.declared)
+                const ref = named.declared.find((entry) => entry.path === path)
+                return json({
+                    id: target.id,
+                    file: basename(path),
+                    ...(ref === undefined ? {} : { tier: ref.tier, field: ref.field }),
+                    exists: existsSync(path),
+                    content: existsSync(path) ? readFileSync(path, "utf8") : "",
+                })
+            }),
+        { capability: "admin" },
+    )
+
+    router.add(
+        "PUT",
+        "/v1/agents/:id/workspace/:file",
+        (context) =>
+            withTarget(runtime, options, context, async (target) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(WorkspaceFileBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const manifest = target.file
+                if (manifest === undefined) {
+                    return fail(
+                        {
+                            code: "config_not_editable",
+                            message: `"${target.id}" was loaded from an object, so it has no files to write.`,
+                            hint: "An embedder holding new settings passes the new object to dispose() and adopt().",
+                        },
+                        409,
+                    )
+                }
+                const named = await declaredWorkspace(target.id, manifest)
+                if (named instanceof Response) return named
+                const { workspaceDir, declared } = named
+                const name = context.params.file ?? ""
+                const path = findDeclared(declared, workspaceDir, name)
+                if (path === undefined) return unknownWorkspaceFile(target.id, name, declared)
+                const before = existsSync(path) ? readFileSync(path, "utf8") : undefined
+                mkdirSync(dirname(path), { recursive: true })
+                writeFileSync(path, parsed.value.content, "utf8")
+                const written = basename(path)
+                if (target.agent === undefined) {
+                    const error = await runtime.diagnose(manifest)
+                    return json({
+                        id: target.id,
+                        file: written,
+                        written: true,
+                        loads: error === undefined,
+                        ...(error === undefined ? {} : { error }),
+                        applied: false,
+                        pending: notRunning(target.id),
+                    })
+                }
+                try {
+                    const outcome = await runtime.reload(target.id)
+                    return json({
+                        id: target.id,
+                        file: written,
+                        written: true,
+                        loads: true,
+                        ...(outcome.status === "pending"
+                            ? { applied: false, pending: pendingDetail(outcome) }
+                            : { applied: true }),
+                    })
+                } catch (error) {
+                    // Refused before the running agent was touched: put the old text back, so the
+                    // file on disk is the one in force.
+                    if (before === undefined) rmSync(path, { force: true })
+                    else writeFileSync(path, before, "utf8")
+                    if (isHarnessError(error)) return fail(error.toDetail(), 400)
+                    throw error
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    /**
+     * Fetch the tool providers now and reload only if the catalogue the agent serves moved (pilot.5).
+     * The embedder used to PATCH `tools.pinned` or POST `/reload` after a connection,
+     * and retry the `pending` on the next chat open; this is one call that reloads only when needed.
+     * `admin`, like `/reload`: it can replace the agent.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/tools/refresh",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(ToolsRefreshBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                try {
+                    const outcome = await runtime.refreshTools(agent.id, {
+                        ...(parsed.value.providers === undefined
+                            ? {}
+                            : { providers: parsed.value.providers }),
+                    })
+                    return json(
+                        { id: agent.id, ...outcome },
+                        outcome.reload === "pending" ? 202 : 200,
+                    )
+                } catch (error) {
+                    if (isHarnessError(error)) {
+                        return fail(
+                            error.toDetail(),
+                            error.code === "agent_turn_in_flight" ? 409 : 400,
+                        )
+                    }
+                    throw error
+                }
+            }),
+        { capability: "admin" },
+    )
+
     router.add(
         "POST",
         "/v1/agents/:id/reload",
         (context) =>
             withAgent(runtime, context, async (agent) => {
                 try {
-                    const admitted = await runtime.replace(agent.id)
+                    const outcome = await runtime.reload(agent.id)
+                    // Busy: the running turns finish on the old configuration and the swap follows,
+                    // announced by `agent.reloaded`. 202, because the change is accepted and not yet
+                    // in force — a 409 here used to mean "try again", in a team silo, forever.
+                    if (outcome.status === "pending") {
+                        return json(
+                            {
+                                id: agent.id,
+                                status: "pending",
+                                adopted: [],
+                                running: outcome.running,
+                                holdAfterMs: outcome.holdAfterMs,
+                            },
+                            202,
+                        )
+                    }
                     return json({
                         id: agent.id,
                         status: "loaded",
                         // Every agent that came back, because replacing a supervisor replaces its team:
                         // they load from one manifest as one unit, so a caller holding a list needs to
                         // know the members are new instances too.
-                        adopted: admitted.map((entry) => entry.id),
+                        adopted: outcome.adopted.map((entry) => entry.id),
                     })
                 } catch (error) {
                     // The runtime's own refusals carry the field and the remedy — a team member has no
@@ -1039,6 +1674,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
              * answer — the thing they asked for exists, and it is not running yet.
              */
             try {
+                if (template === undefined) await provision.claim?.(created.manifestPath)
                 const admitted = await runtime.adopt(created.manifestPath)
                 return json(
                     {
@@ -1140,12 +1776,22 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 return json({ ...written, applied: "none", adopted: [], stopped: true })
             }
             try {
-                const admitted = hosted
-                    ? await runtime.replace(found.id)
-                    : await runtime.adopt(found.manifestPath)
+                if (hosted) {
+                    const outcome = await runtime.reload(found.id)
+                    // A turn is running: the secret is written and in force once it finishes.
+                    if (outcome.status === "pending") {
+                        return json({ ...written, applied: "pending", adopted: [] })
+                    }
+                    return json({
+                        ...written,
+                        applied: "reloaded",
+                        adopted: outcome.adopted.map((agent) => agent.id),
+                    })
+                }
+                const admitted = await runtime.adopt(found.manifestPath)
                 return json({
                     ...written,
-                    applied: hosted ? "reloaded" : "adopted",
+                    applied: "adopted",
                     adopted: admitted.map((agent) => agent.id),
                 })
             } catch (error) {
@@ -1276,6 +1922,117 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         { capability: "admin" },
     )
 
+    /**
+     * Delete an agent: off this host, its rows out of the store, its directory off disk. Irreversible,
+     * so the request names the agent twice (`?confirm=<id>`), the way `remove` makes a person type it.
+     *
+     * The order is the CLI's `remove`, and the reason is the same: everything checkable is checked
+     * before anything happens, and the irreplaceable thing — the directory — goes last, so a failure
+     * part-way leaves an agent that still loads rather than data nothing can name.
+     */
+    router.add(
+        "DELETE",
+        "/v1/agents/:id",
+        async (context) => {
+            const id = context.params.id ?? ""
+            if (!reachesAgent(context.principal, id)) return notFound("agent", id)
+            const hosted = runtime.list().some((agent) => agent.id === id)
+            const known = await runtime.store.agentState.get(id)
+            const remover = options.remover
+            if (remover === undefined) {
+                return fail(
+                    {
+                        code: "agent_remove_unsupported",
+                        message: "This server cannot delete agents.",
+                        hint: "`serve` provides deletion; an embedded handler has no sandbox to delete from. Use the CLI's `remove`.",
+                    },
+                    501,
+                )
+            }
+            if (context.url.searchParams.get("confirm") !== id) {
+                return fail(
+                    {
+                        code: "agent_remove_unconfirmed",
+                        message: `Deleting ${id} needs ?confirm=${id}.`,
+                        hint: "It deletes the agent's conversations, memory and files for good, so the request names the agent twice. POST /v1/agents/:id/stop switches one off and keeps everything.",
+                        field: "confirm",
+                    },
+                    400,
+                )
+            }
+            const located = remover.locate(id)
+            if (!located.ok) {
+                if (!hosted && known === undefined && located.status === 404) {
+                    return notFound("agent", id)
+                }
+                return fail(located.error, located.status)
+            }
+            if (hosted) {
+                try {
+                    await runtime.dispose(id, "stopped")
+                } catch (error) {
+                    if (isHarnessError(error)) return fail(error.toDetail(), 409)
+                    throw error
+                }
+            }
+            const purged = await runtime.store.purgeAgent(id)
+            await remover.deleteDir(located.dir)
+            return json({ id, removed: true, dir: located.dir, ...purged })
+        },
+        { capability: "admin" },
+    )
+
+    // ─── Deliveries ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Exact text out on one of the agent's channels, with no model turn — a reminder, an outreach
+     * message — through the same outbox as a reply, so retries and `key` idempotency are its own.
+     *
+     * `admin`, because it speaks as the agent to any recipient with nothing between the caller and
+     * the channel. Written into that conversation's history as the agent's, once: when the person
+     * answers, the agent sees what it "said". A repeated key is accepted, and neither sent nor
+     * recorded again.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/deliveries",
+        async (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(DeliveryBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const input = parsed.value
+                if (!runtime.channels.hasChannel(agent.id, input.channel)) {
+                    return fail(
+                        {
+                            code: "delivery_channel_unknown",
+                            message: `${agent.id} has no running channel "${input.channel}".`,
+                            hint: "Name a channel id from the agent's manifest (GET /v1/agents/:id lists them with their status). A disabled channel is not running and cannot send.",
+                            field: "channel",
+                        },
+                        404,
+                    )
+                }
+                // The key an inbound message from `to` on this channel resolves to, so a reply lands in
+                // the conversation the delivery was written into.
+                const sessionKey = formatSessionKey({ channel: input.channel, peerId: input.to })
+                const outside = outsideSession(context, sessionKey)
+                if (outside !== undefined) return outside
+                const { inserted } = await runtime.channels.deliver({
+                    agentId: agent.id,
+                    sessionKey,
+                    channelId: input.channel,
+                    recipient: input.to,
+                    text: input.text,
+                    key: input.key,
+                })
+                if (inserted) await agent.recordDelivered(input.text, { sessionKey })
+                return json({ sessionKey, key: input.key, duplicate: !inserted }, 202)
+            }),
+        { capability: "admin" },
+    )
+
     // ─── Turns ───────────────────────────────────────────────────────────────────────────
 
     router.add(
@@ -1307,20 +2064,69 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 const wantsChunks = input.chunks === true
                 const text = input.text
 
-                const sessionKey = input.sessionKey ?? "api:default"
+                const requested = input.sessionKey ?? "api:default"
                 // The one place a caller *names* a session they may never have seen. Without this,
                 // a key scoped to `team_42:` could write into `team_7:`'s conversation simply by
                 // asking — which is the difference between a filter and a boundary.
-                const outside = outsideSession(context, sessionKey)
+                const outside = outsideSession(context, requested)
                 if (outside !== undefined) return outside
                 const deliver = parseDeliver(input.deliver)
                 if (deliver.kind === "error") return fail(deliver.error, 400)
 
-                const from = parseFrom(input.from)
-                if (from.kind === "error") return fail(from.error, 400)
+                const parsedFrom = parseFrom(input.from)
+                if (parsedFrom.kind === "error") return fail(parsedFrom.error, 400)
+                const from = senderFor(context.principal, parsedFrom.from)
+                if (!from.ok) return fail(from.error, 403)
+                const sessionKey = await sessionFor(
+                    agent,
+                    context.principal,
+                    requested,
+                    from.from,
+                    input.peerAsk,
+                )
 
                 const idempotency = parseIdempotencyKey(context.request)
                 if (idempotency.kind === "error") return fail(idempotency.error, 400)
+
+                // A peer's text is fenced as untrusted, and a note sits outside that fence as trusted
+                // framing: from a peer it would be a way to speak past the fence its own text is in.
+                if (input.runtimeNote !== undefined && from.from?.kind === "agent") {
+                    return fail(
+                        {
+                            code: "message_note_untrusted",
+                            message: "A message from an agent cannot carry a runtimeNote.",
+                            hint: "A note is trusted framing outside the fence a peer's text is shown in. Put what the peer has to say in text.",
+                            field: "runtimeNote",
+                        },
+                        400,
+                    )
+                }
+
+                // Images are read and checked now, for the governor's reason below: once the turn
+                // detaches, a missing file or a model that cannot see would be refused to nobody.
+                // The role is resolved now for the same reason: after the turn detaches, an unknown
+                // name would throw into a turn nobody is waiting on.
+                if (input.role !== undefined) {
+                    try {
+                        agent.roles.byName(input.role)
+                    } catch (error) {
+                        if (isHarnessError(error)) {
+                            return fail({ ...error.toDetail(), field: "role" }, 400)
+                        }
+                        throw error
+                    }
+                }
+                let images: readonly ImageInput[] = []
+                if (input.images !== undefined && input.images.length > 0) {
+                    const blind = agent.refusesImages(input.role)
+                    if (blind !== undefined) return fail(blind.toDetail(), 400)
+                    try {
+                        images = await readImages(agent.dir, input.images)
+                    } catch (error) {
+                        if (isHarnessError(error)) return fail(error.toDetail(), 400)
+                        throw error
+                    }
+                }
 
                 // The governor answers now, while there is still a response to put it in. After this
                 // the turn detaches and a refusal would reach nobody. Nothing is recorded for a
@@ -1348,7 +2154,14 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                         agentId: agent.id,
                         key: idempotency.key,
                         turnId,
-                        inputHash: await inputHash(sessionKey, text),
+                        // Images are part of what was sent, so a retry with different ones is a
+                        // different message rather than a replay of the first.
+                        inputHash: await inputHash(
+                            sessionKey,
+                            images.length === 0
+                                ? text
+                                : `${text}\n${images.map((image) => image.data).join("\n")}`,
+                        ),
                         now: new Date(),
                     })
                     if (claim.kind !== "claimed") admission.release()
@@ -1392,13 +2205,24 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                     .send(text, {
                         admission,
                         sessionKey,
+                        sessionResolved: true,
                         turnId,
                         source: "api",
                         ...(from.from === undefined ? {} : { from: from.from }),
+                        ...(images.length === 0 ? {} : { images }),
+                        ...(input.runtimeNote === undefined ? {} : { turnNote: input.runtimeNote }),
+                        ...(input.role === undefined ? {} : { role: input.role }),
+                        ...(input.peerAsk === undefined ? {} : { peerAsk: input.peerAsk }),
                         signal: controller.signal,
                     })
                     .then(async (result) => {
-                        if (deliver.target === undefined || result.text.trim() === "") return
+                        const attachments = result.attachments ?? []
+                        if (
+                            deliver.target === undefined ||
+                            (result.text.trim() === "" && attachments.length === 0)
+                        ) {
+                            return
+                        }
                         await runtime.channels.deliver({
                             agentId: agent.id,
                             sessionKey,
@@ -1406,6 +2230,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                             recipient: deliver.target.to,
                             turnId,
                             text: result.text,
+                            ...(attachments.length === 0 ? {} : { attachments }),
                         })
                     })
                     .catch(() => {
@@ -1426,6 +2251,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                     accepted: { turnId, sessionKey },
                     status: 202,
                     chunks: wantsChunks,
+                    children: input.children === true,
                 })
             }),
         { capability: "chat" },
@@ -1454,9 +2280,9 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      * read a final text that does not exist yet. It is terminal-or-not, `status !== "running"`, so
      * a new `TurnEndReason` cannot be silently misfiled as still-running.
      *
-     * The buffer is checked before the store, so the common case costs no query. The window between
-     * that check and `attach` is real and benign: eviction can land in it, and `streamTurn`'s own
-     * fallback frame covers it.
+     * The store is read first, because the turn's session decides whether a scoped key may follow it;
+     * that costs one query per attach. The window between the buffer check and `attach` is real and
+     * benign: eviction can land in it, and `streamTurn`'s own fallback frame covers it.
      */
     router.add(
         "GET",
@@ -1464,8 +2290,9 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         (context) =>
             withAgent(runtime, context, async (agent) => {
                 const turnId = context.params.turnId ?? ""
+                const record = await agent.store.turns.get(turnId)
+                if (outsideTurn(context, record)) return notFound("turn", turnId)
                 if (runtime.streams.state(turnId) === undefined) {
-                    const record = await agent.store.turns.get(turnId)
                     if (record === undefined)
                         return notFound(
                             "turn",
@@ -1476,6 +2303,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 }
                 return streamTurn(runtime, turnId, {
                     chunks: context.url.searchParams.get("chunks") === "true",
+                    children: context.url.searchParams.get("children") === "true",
                 })
             }),
         { capability: "read", streaming: true },
@@ -1485,8 +2313,10 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "POST",
         "/v1/agents/:id/turns/:turnId/stop",
         (context) =>
-            withAgent(runtime, context, () => {
+            withAgent(runtime, context, async (agent) => {
                 const turnId = context.params.turnId ?? ""
+                if (outsideTurn(context, await agent.store.turns.get(turnId)))
+                    return notFound("turn", turnId)
                 const controller = running.get(turnId)
                 if (controller === undefined) {
                     return fail(
@@ -1533,7 +2363,9 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "/v1/agents/:id/approvals",
         (context) =>
             withAgent(runtime, context, async (agent) =>
-                json({ approvals: approvals.pending(agent.id) }),
+                json({
+                    approvals: visibleSessions(context.principal, approvals.pending(agent.id)),
+                }),
             ),
         { capability: "read" },
     )
@@ -1555,15 +2387,22 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "POST",
         "/v1/agents/:id/approvals/:approvalId",
         (context) =>
-            withAgent(runtime, context, async () => {
+            withAgent(runtime, context, async (agent) => {
                 const body = await readJson(context.request)
                 if (body.kind === "error") return fail(body.error, 400)
                 const parsed = parseBody(ApprovalBody, body.value)
                 if (!parsed.ok) return fail(parsed.error, 400)
                 const input = parsed.value
 
+                // The registry is per process, so an id is looked up among this agent's questions in
+                // this caller's sessions first: another agent's or another session's question answers
+                // exactly as one that was never asked.
                 const approvalId = context.params.approvalId ?? ""
-                if (!approvals.resolve(approvalId, input.granted)) {
+                const reachable = visibleSessions(context.principal, approvals.pending(agent.id))
+                if (
+                    !reachable.some((pending) => pending.approvalId === approvalId) ||
+                    !approvals.resolve(approvalId, input.granted)
+                ) {
                     return fail(
                         {
                             code: "approval_not_found",
@@ -1730,6 +2569,9 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                           ...(scope.agents === undefined ? {} : { agents: scope.agents }),
                           ...(scope.sessions === undefined ? {} : { sessions: scope.sessions }),
                           ...(scope.can === undefined ? {} : { can: scope.can }),
+                          ...(scope.participant === undefined
+                              ? {}
+                              : { participant: scope.participant }),
                       }
 
             const secret = newKeySecret()
@@ -1948,6 +2790,646 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         { capability: "admin" },
     )
 
+    /**
+     * Participants, rooms and DMs (Phase 27).
+     *
+     * **A bound key speaks only as its participant, and sees only its own conversations.** The same
+     * rule `senderFor` applies to a turn's sender, applied to a room's author: a key minted with
+     * `scope.participant` posts as that participant and no other, and a conversation it is not a
+     * member of answers 404, the same 404 as one that does not exist. An agent scope applies too: a
+     * key must reach every agent in a conversation to see it at all.
+     */
+    const boundParticipant = (principal: Principal): string | undefined =>
+        principal.kind === "key" ? principal.scope?.participant : undefined
+    const seesConversation = (principal: Principal, conversation: ConversationRecord): boolean => {
+        const bound = boundParticipant(principal)
+        if (bound !== undefined && !conversation.members.includes(bound)) return false
+        return conversation.members.every((member) => {
+            const agentId = agentOf(member)
+            return agentId === undefined || reachesAgent(principal, agentId)
+        })
+    }
+    const conversationNotFound = (id: string) =>
+        fail(
+            {
+                code: "conversation_not_found",
+                message: `No conversation "${id}".`,
+                hint: "GET /v1/conversations lists the ones this credential can see.",
+            },
+            404,
+        )
+    const withConversation = async (
+        context: RequestContext,
+        work: (conversation: ConversationRecord) => Promise<Response>,
+    ): Promise<Response> => {
+        const id = context.params.conversationId ?? ""
+        const conversation = await runtime.store.conversations.get(id)
+        if (conversation === undefined || !seesConversation(context.principal, conversation)) {
+            return conversationNotFound(id)
+        }
+        return work(conversation)
+    }
+    const refusedBy = (error: unknown): Response => {
+        if (!isHarnessError(error)) throw error
+        return fail(
+            error.toDetail(),
+            error.code.endsWith("_not_found") ? 404 : error.code.endsWith("_forbidden") ? 403 : 400,
+        )
+    }
+
+    router.add(
+        "POST",
+        "/v1/participants",
+        async (context) => {
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(ParticipantBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            try {
+                const input = parsed.value
+                return json(
+                    await runtime.conversations.registerParticipant({
+                        id: input.id,
+                        ...(input.name === undefined ? {} : { name: input.name }),
+                        ...(input.role === undefined ? {} : { role: input.role }),
+                        ...(input.title === undefined ? {} : { title: input.title }),
+                        ...(input.timezone === undefined ? {} : { timezone: input.timezone }),
+                        ...(input.channelIds === undefined ? {} : { channelIds: input.channelIds }),
+                    }),
+                    201,
+                )
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/participants",
+        async () => json({ participants: await runtime.store.conversations.participants() }),
+        { capability: "read" },
+    )
+
+    router.add(
+        "DELETE",
+        "/v1/participants/:participantId",
+        async (context) => {
+            const id = context.params.participantId ?? ""
+            const deleted = await runtime.store.conversations.deleteParticipant(id)
+            if (!deleted) {
+                return fail(
+                    {
+                        code: "participant_not_found",
+                        message: `No participant "${id}".`,
+                        hint: "GET /v1/participants lists them.",
+                    },
+                    404,
+                )
+            }
+            return json({ id, deleted: true })
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "POST",
+        "/v1/conversations",
+        async (context) => {
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(ConversationBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            const bound = boundParticipant(context.principal)
+            // A bound key creates only conversations it is in; otherwise it would make rooms it
+            // cannot read, and a stranger's room is not somebody's to start.
+            if (bound !== undefined && !parsed.value.members.includes(bound)) {
+                return fail(
+                    {
+                        code: "conversation_creator_not_member",
+                        message: `This key speaks for ${bound}, who is not among the members.`,
+                        hint: `Include "${bound}" in members. A backend creating rooms for others needs a key minted without scope.participant.`,
+                        field: "members",
+                    },
+                    403,
+                )
+            }
+            const outside = parsed.value.members
+                .map((member) => agentOf(member))
+                .filter(
+                    (id): id is string => id !== undefined && !reachesAgent(context.principal, id),
+                )
+            if (outside.length > 0) {
+                return fail(
+                    {
+                        code: "conversation_member_unknown",
+                        message: `No participant "agent:${outside[0]}".`,
+                        hint: "That agent is not hosted here. GET /v1/agents lists the ones that are.",
+                        field: "members",
+                    },
+                    400,
+                )
+            }
+            try {
+                return json(
+                    await runtime.conversations.create({
+                        kind: parsed.value.kind,
+                        members: parsed.value.members,
+                        ...(parsed.value.title === undefined ? {} : { title: parsed.value.title }),
+                    }),
+                    201,
+                )
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/conversations",
+        async (context) => {
+            const all = await runtime.store.conversations.list()
+            return json({
+                conversations: all.filter((conversation) =>
+                    seesConversation(context.principal, conversation),
+                ),
+            })
+        },
+        { capability: "read" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/conversations/:conversationId",
+        (context) => withConversation(context, async (conversation) => json(conversation)),
+        { capability: "read" },
+    )
+
+    router.add(
+        "PATCH",
+        "/v1/conversations/:conversationId/members",
+        (context) =>
+            withConversation(context, async (conversation) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(MembersBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                try {
+                    return json(
+                        await runtime.conversations.setMembers(
+                            conversation.id,
+                            parsed.value.add ?? [],
+                            parsed.value.remove ?? [],
+                        ),
+                    )
+                } catch (error) {
+                    return refusedBy(error)
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    router.add(
+        "POST",
+        "/v1/conversations/:conversationId/messages",
+        (context) =>
+            withConversation(context, async (conversation) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(ConversationMessageBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const bound = boundParticipant(context.principal)
+                const claimed = parsed.value.authorId
+                if (bound !== undefined && claimed !== undefined && claimed !== bound) {
+                    return fail(
+                        {
+                            code: "sender_not_bound_participant",
+                            message: `This key speaks for ${bound}, and the message names ${claimed}.`,
+                            hint: `Omit authorId (it is filled in), or send "${bound}". A backend that posts for others needs a key minted without scope.participant.`,
+                            field: "authorId",
+                        },
+                        403,
+                    )
+                }
+                const authorId = bound ?? claimed
+                if (authorId === undefined) {
+                    return fail(
+                        {
+                            code: "conversation_author_required",
+                            message: "A message needs an author.",
+                            hint: "Send authorId, the human member who said it. A key bound to a participant fills it in.",
+                            field: "authorId",
+                        },
+                        400,
+                    )
+                }
+                try {
+                    const message = await runtime.conversations.post({
+                        conversationId: conversation.id,
+                        authorId,
+                        text: parsed.value.text,
+                        ...(parsed.value.mentions === undefined
+                            ? {}
+                            : { mentions: parsed.value.mentions }),
+                    })
+                    return json(message, 202)
+                } catch (error) {
+                    return refusedBy(error)
+                }
+            }),
+        { capability: "chat" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/conversations/:conversationId/messages",
+        (context) =>
+            withConversation(context, async (conversation) => {
+                const after = Number(context.url.searchParams.get("after") ?? 0)
+                const limit = Number(context.url.searchParams.get("limit") ?? 200)
+                const messages = await runtime.store.conversations.messages(conversation.id, {
+                    after: Number.isFinite(after) && after > 0 ? after : 0,
+                    limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 500) : 200,
+                })
+                return json({
+                    conversationId: conversation.id,
+                    messages,
+                    ...(messages.length === 0 ? {} : { nextAfter: messages.at(-1)?.seq }),
+                })
+            }),
+        { capability: "read" },
+    )
+
+    router.add(
+        "PUT",
+        "/v1/participants/:participantId/presence",
+        async (context) => {
+            const id = context.params.participantId ?? ""
+            const bound = boundParticipant(context.principal)
+            // Pushed by the embedder for anyone, or by a member's own front end for them alone.
+            if (bound !== undefined && bound !== id) {
+                return fail(
+                    {
+                        code: "sender_not_bound_participant",
+                        message: `This key speaks for ${bound}, and the presence names ${id}.`,
+                        hint: "A key bound to a participant sets only that participant's presence. The embedder's backend, holding an unbound key, sets anyone's.",
+                    },
+                    403,
+                )
+            }
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(PresenceBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            try {
+                return json(await runtime.conversations.setPresence(id, parsed.value.presence))
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "chat" },
+    )
+
+    /** What a stand-in queued for its owner (Phase 28). A bound key sees only its own. */
+    router.add(
+        "GET",
+        "/v1/actions",
+        async (context) => {
+            const status = context.url.searchParams.get("status")
+            const bound = boundParticipant(context.principal)
+            const all = await runtime.store.conversations.actions({
+                ...(bound === undefined ? {} : { ownerId: bound }),
+                ...(status === "pending" ||
+                status === "done" ||
+                status === "failed" ||
+                status === "denied"
+                    ? { status }
+                    : {}),
+            })
+            return json({
+                actions: all.filter((action) => reachesAgent(context.principal, action.agentId)),
+            })
+        },
+        { capability: "read" },
+    )
+
+    router.add(
+        "POST",
+        "/v1/actions/:actionId",
+        async (context) => {
+            const id = context.params.actionId ?? ""
+            const action = await runtime.store.conversations.action(id)
+            const bound = boundParticipant(context.principal)
+            // Someone else's action answers exactly like a missing one.
+            if (
+                action === undefined ||
+                !reachesAgent(context.principal, action.agentId) ||
+                (bound !== undefined && bound !== action.ownerId)
+            ) {
+                return fail(
+                    {
+                        code: "action_not_found",
+                        message: `No action "${id}".`,
+                        hint: "GET /v1/actions lists the ones waiting on you.",
+                    },
+                    404,
+                )
+            }
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(DecisionBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            try {
+                return json(await runtime.conversations.decideAction(id, parsed.value.approve))
+            } catch (error) {
+                if (isHarnessError(error) && error.code === "action_already_decided") {
+                    return fail(error.toDetail(), 409)
+                }
+                return refusedBy(error)
+            }
+        },
+        { capability: "chat" },
+    )
+
+    router.add(
+        "PUT",
+        "/v1/agents/:id/assignee",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(AssigneeBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const bound = boundParticipant(context.principal)
+                // Assigning is an admin participant's act; a member's key cannot assign agents,
+                // themselves included. An unbound key is the embedder's own backend.
+                if (bound !== undefined) {
+                    const by = await runtime.store.conversations.participant(bound)
+                    if (by?.role !== "admin") {
+                        return fail(
+                            {
+                                code: "assignment_requires_admin",
+                                message: `${bound} is not an admin participant.`,
+                                hint: 'Only a participant registered with role "admin" assigns agents to members.',
+                            },
+                            403,
+                        )
+                    }
+                }
+                try {
+                    const assigned = await runtime.conversations.assign({
+                        agentId: agent.id,
+                        participantId: parsed.value.participantId,
+                        ...(bound === undefined ? {} : { assignedBy: bound }),
+                        ...(parsed.value.channelIds === undefined
+                            ? {}
+                            : { channelIds: parsed.value.channelIds }),
+                    })
+                    // An owner or peer session scope works from now on; its warning goes (15.14).
+                    await agent.checkSessionScope()
+                    return json(assigned)
+                } catch (error) {
+                    return refusedBy(error)
+                }
+            }),
+        { capability: "admin" },
+    )
+
+    /**
+     * Who the agent is assigned to, read back (pilot.9). `assignment: null` when nobody:
+     * an unassigned agent is a normal state, and a 404 would read as the agent itself missing.
+     */
+    router.add(
+        "GET",
+        "/v1/agents/:id/assignee",
+        (context) =>
+            withAgent(runtime, context, async (agent) =>
+                json({
+                    id: agent.id,
+                    assignment: (await runtime.store.conversations.assignment(agent.id)) ?? null,
+                }),
+            ),
+        { capability: "read" },
+    )
+
+    router.add(
+        "DELETE",
+        "/v1/agents/:id/assignee",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const unassigned = await runtime.store.conversations.unassign(agent.id)
+                // Its peers, and its former siblings', change with it (`ask_agent`, hot reload).
+                if (unassigned) runtime.schedulePeerCheck()
+                await agent.checkSessionScope()
+                return json({ id: agent.id, unassigned })
+            }),
+        { capability: "admin" },
+    )
+
+    /**
+     * Team memory scopes (Phase 29). Who may write which scope is decided in the hub; the route only
+     * says who is asking. A bound key is its participant. An unbound key is the embedder's backend,
+     * the operator — but only with `admin`: `chat` alone is not enough to write the whole team's memory.
+     */
+    const memoryActor = (
+        principal: Principal,
+    ):
+        | { readonly ok: true; readonly actor: string | undefined }
+        | { readonly ok: false; readonly response: Response } => {
+        const bound = boundParticipant(principal)
+        if (bound !== undefined || can(principal, "admin")) return { ok: true, actor: bound }
+        return {
+            ok: false,
+            response: fail(
+                {
+                    code: "memory_write_requires_admin",
+                    message: "This key is bound to no participant and does not carry admin.",
+                    hint: "A member writes through a key minted with scope.participant; the embedder's backend writes shared scopes with an admin key.",
+                },
+                403,
+            ),
+        }
+    }
+
+    router.add(
+        "POST",
+        "/v1/memory/notes",
+        async (context) => {
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(NoteBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            const who = memoryActor(context.principal)
+            if (!who.ok) return who.response
+            try {
+                return json(
+                    await runtime.conversations.addNote({
+                        scope: parsed.value.scope,
+                        text: parsed.value.text,
+                        ...(who.actor === undefined ? {} : { authorId: who.actor }),
+                    }),
+                    201,
+                )
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "chat" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/memory/notes",
+        async (context) => {
+            const scope = context.url.searchParams.get("scope") ?? ""
+            try {
+                return json({
+                    notes: await runtime.conversations.notes(
+                        scope,
+                        boundParticipant(context.principal),
+                    ),
+                })
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "read" },
+    )
+
+    router.add(
+        "DELETE",
+        "/v1/memory/notes/:noteId",
+        async (context) => {
+            const who = memoryActor(context.principal)
+            if (!who.ok) return who.response
+            try {
+                await runtime.conversations.deleteNote(context.params.noteId ?? "", who.actor)
+                return json({ id: context.params.noteId, deleted: true })
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "chat" },
+    )
+
+    router.add(
+        "GET",
+        "/v1/participants/:participantId/memory/reads",
+        async (context) => {
+            try {
+                return json({
+                    reads: await runtime.conversations.reads(
+                        context.params.participantId ?? "",
+                        boundParticipant(context.principal),
+                    ),
+                })
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "read" },
+    )
+
+    /** An admin participant's act, like assignment. An unbound admin key is the embedder's backend. */
+    const requireAdminParticipant = async (principal: Principal): Promise<Response | undefined> => {
+        const bound = boundParticipant(principal)
+        if (bound === undefined) return undefined
+        const by = await runtime.store.conversations.participant(bound)
+        if (by?.role === "admin") return undefined
+        return fail(
+            {
+                code: "memory_scope_forbidden",
+                message: `${bound} is not an admin participant.`,
+                hint: 'Only a participant registered with role "admin" defines projects and names the space writer.',
+            },
+            403,
+        )
+    }
+
+    router.add(
+        "GET",
+        "/v1/projects",
+        async () => json({ projects: await runtime.store.conversations.projects() }),
+        { capability: "read" },
+    )
+
+    router.add(
+        "PUT",
+        "/v1/projects/:projectId",
+        async (context) => {
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(ProjectBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            const refusal = await requireAdminParticipant(context.principal)
+            if (refusal !== undefined) return refusal
+            // An agent this key cannot reach answers like one that does not exist.
+            const unreachable = (parsed.value.agents ?? []).find(
+                (id) => !reachesAgent(context.principal, id),
+            )
+            if (unreachable !== undefined) {
+                return fail(
+                    {
+                        code: "agent_not_found",
+                        message: `No agent "${unreachable}".`,
+                        hint: "GET /v1/agents lists the ones hosted here.",
+                    },
+                    404,
+                )
+            }
+            try {
+                return json(
+                    await runtime.conversations.upsertProject({
+                        id: context.params.projectId ?? "",
+                        ...(parsed.value.name === undefined ? {} : { name: parsed.value.name }),
+                        ...(parsed.value.agents === undefined
+                            ? {}
+                            : { agents: parsed.value.agents }),
+                    }),
+                )
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "DELETE",
+        "/v1/projects/:projectId",
+        async (context) => {
+            const refusal = await requireAdminParticipant(context.principal)
+            if (refusal !== undefined) return refusal
+            const id = context.params.projectId ?? ""
+            return json({ id, deleted: await runtime.store.conversations.deleteProject(id) })
+        },
+        { capability: "admin" },
+    )
+
+    router.add(
+        "PUT",
+        "/v1/memory/space/writer",
+        async (context) => {
+            const body = await readJson(context.request)
+            if (body.kind === "error") return fail(body.error, 400)
+            const parsed = parseBody(SpaceWriterBody, body.value)
+            if (!parsed.ok) return fail(parsed.error, 400)
+            const refusal = await requireAdminParticipant(context.principal)
+            if (refusal !== undefined) return refusal
+            const bound = boundParticipant(context.principal)
+            try {
+                await runtime.conversations.setSpaceWriter(parsed.value.writer, bound)
+                return json({ writer: parsed.value.writer })
+            } catch (error) {
+                return refusedBy(error)
+            }
+        },
+        { capability: "admin" },
+    )
+
     router.add(
         "GET",
         "/v1/usage",
@@ -2020,7 +3502,8 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         (context) =>
             withAgent(runtime, context, async (agent) => {
                 const record = await agent.store.turns.get(context.params.turnId ?? "")
-                if (record === undefined) return notFound("turn", context.params.turnId ?? "")
+                if (record === undefined || !reachesSession(context.principal, record.sessionKey))
+                    return notFound("turn", context.params.turnId ?? "")
                 return json(record)
             }),
         { capability: "read" },
@@ -2032,10 +3515,96 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "GET",
         "/v1/agents/:id/sessions",
         (context) =>
-            withAgent(runtime, context, async (agent) =>
-                json(visibleSessions(context.principal, await agent.store.sessions.list(agent.id))),
-            ),
+            withAgent(runtime, context, async (agent) => {
+                const sessions = await agent.store.sessions.list(agent.id)
+                const heads = await agent.store.sessions.heads(agent.id)
+                return json(
+                    visibleSessions(
+                        context.principal,
+                        sessions.map((session) => ({
+                            ...session,
+                            head: isHead(session.sessionKey, heads),
+                        })),
+                    ),
+                )
+            }),
         { capability: "read" },
+    )
+
+    /**
+     * "New conversation" for an owner or peer scope (decision 15.12): the caller's conversation now
+     * means a fresh key, on every surface, Telegram included. Registered before `:key` routes.
+     */
+    /**
+     * The conversation a message naming `sessionKey` would run in, by the same function `POST
+     * /messages` applies before its 202 (`sessionFor`). Under `sessions.scope: owner` a terminal's own
+     * key lands in `owner:<P>`, and a client following the turn's events by key has to know that
+     * before it sends, or it filters out the whole reply: `dispach run --plain` printed nothing in
+     * 0.2.2. Nothing is created or changed.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/resolve",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(ResolveBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const requested = parsed.value.sessionKey
+                const outside = outsideSession(context, requested)
+                if (outside !== undefined) return outside
+                const parsedFrom = parseFrom(parsed.value.from)
+                if (parsedFrom.kind === "error") return fail(parsedFrom.error, 400)
+                const from = senderFor(context.principal, parsedFrom.from)
+                if (!from.ok) return fail(from.error, 403)
+                return json({
+                    requested,
+                    sessionKey: await sessionFor(agent, context.principal, requested, from.from),
+                })
+            }),
+        { capability: "chat" },
+    )
+
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/rotate",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(RotateBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const parsedFrom = parseFrom(parsed.value.from)
+                if (parsedFrom.kind === "error") return fail(parsedFrom.error, 400)
+                const from = senderFor(context.principal, parsedFrom.from)
+                if (!from.ok) return fail(from.error, 403)
+                // Only a conversation the caller could read back, by the rule `POST /messages` applies:
+                // resolve where a turn from this sender would land, and refuse when that is outside the
+                // key's reach — a key minted for `team_42:` naming the owner as `from` included.
+                const sender = {
+                    source: "api",
+                    ...(from.from === undefined ? {} : { from: from.from }),
+                }
+                const probe = "api:-"
+                const current = await agent.resolveSessionKey(probe, sender)
+                const rotated =
+                    current === probe || !reachesSession(context.principal, current)
+                        ? undefined
+                        : await agent.rotateSession(sender)
+                if (rotated === undefined) {
+                    return fail(
+                        {
+                            code: "session_not_rotatable",
+                            message: `Agent "${agent.id}" has no conversation of yours to start afresh.`,
+                            hint: `Rotation is for sessions.scope owner or peer, for the owner or a registered participant, by a key that reaches that conversation; this agent's scope is "${agent.manifest.sessions?.scope ?? "channel-peer"}". Otherwise a new conversation is a new sessionKey of your own on the next message.`,
+                        },
+                        409,
+                    )
+                }
+                return json(rotated)
+            }),
+        { capability: "chat" },
     )
 
     router.add(
@@ -2110,12 +3679,70 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 }
                 const outside = outsideSession(context, context.params.key ?? "")
                 if (outside !== undefined) return outside
-                await agent.store.sessions.setPhase(
-                    agent.id,
-                    context.params.key ?? "",
-                    phase === null ? undefined : phase,
-                )
-                return json({ phase })
+                const key = context.params.key ?? ""
+                if (phase === null) await agent.store.sessions.setPhase(agent.id, key, undefined)
+                else await agent.setPhase(key, phase)
+                return json({ sessionKey: key, phase })
+            }),
+        { capability: "write" },
+    )
+
+    // An old wrong answer kept steering new ones through history recall, and deleting the chat was
+    // the only way to stop it (pilot.10). This keeps the history and drops its passages.
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/:key/recall",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(RecallBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const key = context.params.key ?? ""
+                const outside = outsideSession(context, key)
+                if (outside !== undefined) return outside
+                if ((await agent.store.sessions.get(agent.id, key)) === undefined)
+                    return notFound("session", key)
+                await agent.store.sessions.setRecall(agent.id, key, parsed.value.recall)
+                return json({ sessionKey: key, recall: parsed.value.recall })
+            }),
+        { capability: "write" },
+    )
+
+    /**
+     * Compact a conversation now (decision 15.21): everything before its last `keepTurns` turns becomes
+     * a digest and the person's requests, saved as the session's checkpoint, and the next turn starts
+     * from it. Waits for a turn running in that session. The stored messages are untouched, so the
+     * transcript, recall and forgetting are unchanged.
+     */
+    router.add(
+        "POST",
+        "/v1/agents/:id/sessions/:key/compact",
+        (context) =>
+            withAgent(runtime, context, async (agent) => {
+                const body = await readJson(context.request)
+                if (body.kind === "error") return fail(body.error, 400)
+                const parsed = parseBody(CompactBody, body.value)
+                if (!parsed.ok) return fail(parsed.error, 400)
+                const key = context.params.key ?? ""
+                const outside = outsideSession(context, key)
+                if (outside !== undefined) return outside
+                if ((await agent.store.sessions.get(agent.id, key)) === undefined)
+                    return notFound("session", key)
+                try {
+                    return json(
+                        await agent.compactSession(key, {
+                            ...(parsed.value.keepTurns === undefined
+                                ? {}
+                                : { keepTurns: parsed.value.keepTurns }),
+                            signal: context.request.signal,
+                        }),
+                    )
+                } catch (error) {
+                    if (isHarnessError(error) && error.code === "session_too_short")
+                        return fail(error.toDetail(), 409)
+                    throw error
+                }
             }),
         { capability: "write" },
     )
@@ -2152,6 +3779,81 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 return writeSchedule(runtime, agent, body.value, undefined)
             }),
         { capability: "write" },
+    )
+
+    /**
+     * What a schedule expression means, before it is written: the next few instants, the zone in
+     * force and the jitter it would carry. The parser is core's own `parseSchedule`, so a form that
+     * previews here cannot disagree with the write that follows — a second cron parser in the
+     * browser would be a second opinion about what a valid expression is. Registered before `:sid`,
+     * because the router is first-match and "preview" would otherwise be a schedule id.
+     */
+    router.add(
+        "GET",
+        "/v1/agents/:id/schedules/preview",
+        (context) =>
+            withAgent(runtime, context, async () => {
+                const query = context.url.searchParams
+                const kind = query.get("kind") ?? ""
+                const expr = query.get("expr") ?? ""
+                const timezone = query.get("timezone") ?? undefined
+                const count = Math.min(10, Math.max(1, Number(query.get("count") ?? "3") || 3))
+                if (kind !== "cron" && kind !== "every" && kind !== "at") {
+                    return fail(
+                        {
+                            code: "schedule_invalid",
+                            message: `kind must be cron, every or at; got ${JSON.stringify(kind)}.`,
+                            hint: "Send ?kind=cron&expr=0 8 * * *&timezone=Asia/Dhaka, or kind=every&expr=15m, or kind=at&expr=<ISO instant>.",
+                            field: "kind",
+                        },
+                        400,
+                    )
+                }
+                const now = Date.now()
+                let parsed: ReturnType<typeof parseSchedule>
+                try {
+                    parsed = parseSchedule({
+                        id: "preview",
+                        kind,
+                        expr,
+                        timezone,
+                        now,
+                        field: "expr",
+                    })
+                } catch (caught) {
+                    if (isHarnessError(caught)) return fail(caught.toDetail(), 400)
+                    throw caught
+                }
+                const next: number[] = []
+                if (parsed.kind === "at") next.push(parsed.at)
+                else if (parsed.kind === "every") {
+                    for (let step = 1; step <= count; step += 1)
+                        next.push(now + step * parsed.every.ms)
+                } else {
+                    let cursor = now
+                    for (let step = 0; step < count; step += 1) {
+                        const occurrence = nextCron(parsed.spec, cursor, parsed.zone)
+                        if (occurrence === undefined) break
+                        next.push(occurrence)
+                        cursor = occurrence
+                    }
+                }
+                const interval =
+                    parsed.kind === "every"
+                        ? parsed.every.ms
+                        : parsed.kind === "cron" && next.length > 1
+                          ? (next[1] ?? 0) - (next[0] ?? 0)
+                          : undefined
+                return json({
+                    kind: parsed.kind,
+                    zone: parsed.zone,
+                    next: next.map((instant) => new Date(instant).toISOString()),
+                    // The displacement every fire of this schedule would carry, for the id "preview".
+                    // Indicative: the real jitter is keyed on the schedule's own id.
+                    jitterMs: interval === undefined ? 0 : jitterFor("preview", interval),
+                })
+            }),
+        { capability: "read" },
     )
 
     router.add(
@@ -2201,6 +3903,13 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                     enabled: existing.enabled,
                     ...(existing.timezone === undefined ? {} : { timezone: existing.timezone }),
                     ...(existing.role === undefined ? {} : { role: existing.role }),
+                    // Every stored field the write accepts, or a patch of `expr` alone erases them:
+                    // these three were added after this literal and were silently dropped until 0.2.2.
+                    ...(existing.toolsAllow === undefined
+                        ? {}
+                        : { tools: { allow: existing.toolsAllow } }),
+                    ...(existing.timeoutMs === undefined ? {} : { timeoutMs: existing.timeoutMs }),
+                    ...(existing.maxSteps === undefined ? {} : { maxSteps: existing.maxSteps }),
                     ...fields,
                     // The id is the row's identity and the key reconciliation matches on, so a patch
                     // that renamed it would create a second schedule and orphan the first. Dropped from
@@ -2266,7 +3975,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                         sessionKey,
                         turnId,
                         source: `schedule:${row.id}:manual`,
-                        ...(row.role === undefined ? {} : { role: row.role }),
+                        ...scheduleSendOptions(row),
                     })
                     .catch(() => {
                         // Reported on the bus by the turn itself; swallowed here so an unhandled
@@ -2305,24 +4014,35 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "GET",
         "/v1/agents/:id/config",
         (context) =>
-            withAgent(runtime, context, async (agent) => {
-                const source = runtime.sourceOf(agent.id)
-                const file = typeof source === "string" ? source : undefined
+            withTarget(runtime, options, context, async (target) => {
+                const file = target.file
                 const text = file === undefined ? undefined : await readFile(file, "utf8")
                 return json({
+                    // False for an agent on disk that is not running (pilot.15): its file is still
+                    // editable here, and `POST /start` brings it up on the result.
+                    running: target.agent !== undefined,
                     // Named rather than implied: an object-form manifest has no file to edit, and a
                     // client that cannot tell will offer a form whose save can only fail.
                     ...(file === undefined ? { editable: false } : { editable: true, file }),
-                    settings: SETTINGS.filter((setting) =>
-                        PERSON_SETTABLE_PATHS.includes(setting.path),
-                    ).map((setting) => ({
-                        path: setting.path,
-                        means: setting.means,
-                        ...(setting.confirm === undefined ? {} : { confirm: setting.confirm }),
-                        ...(text === undefined
-                            ? {}
-                            : { value: manifestValueAt(text, setting.path.split(".")) }),
-                    })),
+                    // `model.<role>` is the one placeholder a person fills in: `model.fast`.
+                    settings: [
+                        ...SETTINGS.filter(
+                            (setting) =>
+                                PERSON_SETTABLE_PATHS.includes(setting.path) ||
+                                setting.path === "model.<role>",
+                        ).map((setting) => ({
+                            path: setting.path,
+                            means: setting.means,
+                            ...(setting.confirm === undefined ? {} : { confirm: setting.confirm }),
+                            ...(text === undefined
+                                ? {}
+                                : { value: manifestValueAt(text, setting.path.split(".")) }),
+                        })),
+                        // Every named role the file declares, as its concrete path. Without these a
+                        // client can add `model.fast` and then never find it again: the template row
+                        // above has no value, and nothing else lists the roles.
+                        ...declaredRoles(text),
+                    ],
                 })
             }),
         { capability: "admin" },
@@ -2332,72 +4052,145 @@ export function createHandler(options: HandlerOptions): ServerHandler {
         "PATCH",
         "/v1/agents/:id/config",
         (context) =>
-            withAgent(runtime, context, async (agent) => {
+            withTarget(runtime, options, context, async (target) => {
                 const body = await readJson(context.request)
                 if (body.kind === "error") return fail(body.error, 400)
                 const parsed = parseBody(ConfigBody, body.value)
                 if (!parsed.ok) return fail(parsed.error, 400)
+                const single = parsed.value.changes === undefined
+                if (single === (parsed.value.path === undefined)) {
+                    return fail(
+                        {
+                            code: single ? "config_path_unknown" : "config_changes_invalid",
+                            message: single
+                                ? "A request named no path."
+                                : "A request named both a path and changes.",
+                            hint: 'Send { "path", "value" } for one change, or { "changes": [{ "path", "value" }, ...] } for several in one reload.',
+                            field: single ? "path" : "changes",
+                        },
+                        400,
+                    )
+                }
+                const requested = parsed.value.changes ?? [
+                    { ...parsed.value, path: parsed.value.path ?? "" },
+                ]
 
-                const source = runtime.sourceOf(agent.id)
+                const source = target.file
                 if (typeof source !== "string") {
                     return fail(
                         {
                             code: "config_not_editable",
-                            message: `"${agent.id}" was loaded from an object, not from a file, so it has no manifest to change.`,
+                            message: `"${target.id}" was loaded from an object, not from a file, so it has no manifest to change.`,
                             hint: "An embedder holding new settings passes the new object to dispose() and adopt(). This route edits a manifest on disk.",
                         },
                         409,
                     )
                 }
 
-                const setting = settingByPath(parsed.value.path)
-                // `via` and the placeholder paths are in `SETTINGS` and not in
-                // `PERSON_SETTABLE_PATHS`, so the membership test is the one that decides — and the
-                // refusal reads the row anyway, because `channels[].allowFrom` can name the command
-                // that does set it instead of answering "no such setting" about a real field.
-                if (setting === undefined || !PERSON_SETTABLE_PATHS.includes(setting.path)) {
+                // Every unknown path in one refusal (pilot.16): a caller sending one batch to
+                // silos of several versions has to learn all the keys this one lacks, not the first.
+                const unknown = requested
+                    .map((change, index) => ({ change, index }))
+                    .filter(({ change }) => {
+                        const setting = personSetting(change.path) ?? settingByPath(change.path)
+                        return (
+                            setting?.via === undefined && personSetting(change.path) === undefined
+                        )
+                    })
+                if (!single && unknown.length > 0) {
+                    const first = unknown[0]
                     return fail(
                         {
                             code: "config_path_unknown",
-                            message:
-                                setting?.via === undefined
-                                    ? `"${parsed.value.path}" is not a field this surface sets.`
-                                    : `"${parsed.value.path}" is set by \`${setting.via}\`, not by a dotted path.`,
-                            hint:
-                                setting?.via === undefined
-                                    ? `GET /v1/agents/:id/config lists every one. Nearest: ${nearest(parsed.value.path, PERSON_SETTABLE_PATHS) ?? PERSON_SETTABLE_PATHS.join(", ")}.`
-                                    : "It is a key inside a list entry, and the source editor matches a key at an indent — it cannot index a sequence. That action also validates the handle against the service that issues it.",
-                            field: "path",
+                            message: `${unknown.map(({ change, index }) => `"${change.path}" (changes.${index}.path)`).join(", ")} ${unknown.length === 1 ? "is not a field" : "are not fields"} this surface sets. Nothing was written.`,
+                            hint: `GET /v1/agents/:id/config lists every one. Nearest to "${first?.change.path}": ${nearest(first?.change.path ?? "", PERSON_SETTABLE_PATHS) ?? PERSON_SETTABLE_PATHS.join(", ")}.`,
+                            field: `changes.${first?.index ?? 0}.path`,
                         },
                         400,
                     )
                 }
 
-                // The two edits whose only purpose is to stop a check running. Refused rather than
-                // logged: `confirm` absent is not consent, and the sentence is the row's own, so the
-                // terminal and the browser ask the same question in the same words.
-                if (setting.confirm !== undefined && parsed.value.confirm !== true) {
-                    return fail(
-                        {
-                            code: "config_confirm_required",
-                            message: setting.confirm,
-                            hint: 'Send { "confirm": true } beside the value to make this change anyway. Nothing has been written.',
-                            field: "confirm",
-                        },
-                        409,
-                    )
+                const settings: Setting[] = []
+                for (const change of requested) {
+                    const setting = personSetting(change.path) ?? settingByPath(change.path)
+                    // `via` and the placeholder paths are in `SETTINGS` and not in
+                    // `PERSON_SETTABLE_PATHS`, so the membership test is the one that decides — and the
+                    // refusal reads the row anyway, because `channels[].allowFrom` can name the command
+                    // that does set it instead of answering "no such setting" about a real field.
+                    if (setting === undefined || personSetting(change.path) === undefined) {
+                        return fail(
+                            {
+                                code: "config_path_unknown",
+                                message:
+                                    setting?.via === undefined
+                                        ? `"${change.path}" is not a field this surface sets.`
+                                        : `"${change.path}" is set by \`${setting.via}\`, not by a dotted path.`,
+                                hint:
+                                    setting?.via === undefined
+                                        ? `GET /v1/agents/:id/config lists every one. Nearest: ${nearest(change.path, PERSON_SETTABLE_PATHS) ?? PERSON_SETTABLE_PATHS.join(", ")}.`
+                                        : "It is a key inside a list entry, and the source editor matches a key at an indent — it cannot index a sequence. That action also validates the handle against the service that issues it.",
+                                field: "path",
+                            },
+                            400,
+                        )
+                    }
+
+                    // Exactly one of the two: a value with `remove` is a request that means two things.
+                    const removing = change.remove === true
+                    if (removing === (change.value !== undefined)) {
+                        return fail(
+                            {
+                                code: removing
+                                    ? "config_remove_invalid"
+                                    : "config_value_unreadable",
+                                message: removing
+                                    ? "A request named both a value and remove: true."
+                                    : "A request named neither a value nor remove: true.",
+                                hint: 'Send { "path", "value" } to set a field, or { "path", "remove": true } to take it out.',
+                                field: removing ? "remove" : "value",
+                            },
+                            400,
+                        )
+                    }
+
+                    // The two edits whose only purpose is to stop a check running. Refused rather than
+                    // logged: `confirm` absent is not consent, and the sentence is the row's own, so the
+                    // terminal and the browser ask the same question in the same words.
+                    if (setting.confirm !== undefined && change.confirm !== true) {
+                        return fail(
+                            {
+                                code: "config_confirm_required",
+                                message: setting.confirm,
+                                hint: 'Send { "confirm": true } beside the value to make this change anyway. Nothing has been written.',
+                                field: "confirm",
+                            },
+                            409,
+                        )
+                    }
+                    settings.push(setting)
                 }
 
-                let result: Awaited<ReturnType<typeof editManifest>>
+                let results: Awaited<ReturnType<typeof editManifestChanges>>
                 try {
-                    result = await editManifest({
-                        file: source,
-                        path: setting.path.split("."),
-                        // One parser for the person's two editors — see `ConfigBody`. Throws by name
-                        // rather than guessing, because guessing is how `tools.pinned: "exec"`
-                        // becomes a one-character tool list.
-                        value: parseSettingValue(parsed.value.value),
-                    })
+                    results = await editManifestChanges(
+                        source,
+                        requested.map((change) => ({
+                            // The concrete path: `model.fast`, not the row's `model.<role>`.
+                            path: change.path.split("."),
+                            // One parser for the person's two editors — see `ConfigBody`. Throws by
+                            // name rather than guessing, because guessing is how `tools.pinned: "exec"`
+                            // becomes a one-character tool list.
+                            value:
+                                change.value === undefined
+                                    ? undefined
+                                    : parseSettingValue(change.value),
+                            ...(change.remove === true ? { remove: true as const } : {}),
+                            // Refuses a provider config the provider would refuse (an MCP server with
+                            // a credential in its URL), rather than writing it and dropping the provider.
+                            providers: runtime.toolProviderFactories,
+                            mediaProviders: runtime.mediaProviderFactories,
+                        })),
+                    )
                 } catch (error) {
                     if (isHarnessError(error)) return fail(error.toDetail(), 400)
                     throw error
@@ -2415,25 +4208,51 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                  * already written at that point and saying so is the only honest answer — the edit
                  * takes effect at the next start, which is exactly what `dispach config set` reports.
                  * Returning 409 and implying nothing happened would be rule 8 with better manners.
+                 *
+                 * Nothing written, nothing reloaded (pilot.15): a value equal to the one in
+                 * the file is already in force, and reloading for it is the "keeps reloading" report.
                  */
                 let applied: ErrorDetail | undefined
-                try {
-                    await runtime.replace(agent.id)
-                } catch (error) {
-                    if (!isHarnessError(error)) throw error
-                    applied = error.toDetail()
+                if (results.written && target.agent === undefined) {
+                    // Not running (pilot.15): the file is fixed, and nothing is replaced until it starts.
+                    applied = notRunning(target.id)
+                } else if (results.written) {
+                    try {
+                        applied = pendingDetail(await runtime.reload(target.id))
+                    } catch (error) {
+                        if (!isHarnessError(error)) throw error
+                        applied = error.toDetail()
+                    }
                 }
 
-                return json({
-                    path: setting.path,
+                // A roster is rendered at load, so an offer that changed is invisible to every agent
+                // that may ask this one until each reloads. Done here, after this agent's own reload,
+                // because theirs reads this agent's new manifest; reported per peer, never swallowed.
+                const offerChanged = requested.some(
+                    (change, index) =>
+                        change.path === "delegation.offer" &&
+                        results.edits[index]?.changed === true,
+                )
+                const peers = offerChanged
+                    ? await reloadAskers(runtime, target.id, applied === undefined)
+                    : undefined
+
+                const reported = results.edits.map((result, index) => ({
+                    path: settings[index]?.path ?? "",
                     before: result.before,
                     after: result.after,
                     // A reflowed file is correct and its comments have moved, which is a surprise a
                     // person should hear from the surface that did it rather than from `git diff`.
                     reflowed: result.reflowed,
+                    changed: result.changed,
+                }))
+                return json({
+                    ...(single ? reported[0] : { changes: reported }),
+                    reloaded: results.written && applied === undefined,
                     ...(applied === undefined
                         ? { applied: true }
                         : { applied: false, pending: applied }),
+                    ...(peers === undefined ? {} : { peers }),
                 })
             }),
         { capability: "admin" },
@@ -2515,7 +4334,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
 
                 let applied: ErrorDetail | undefined
                 try {
-                    await runtime.replace(agent.id)
+                    applied = pendingDetail(await runtime.reload(agent.id))
                 } catch (error) {
                     if (!isHarnessError(error)) throw error
                     applied = error.toDetail()
@@ -2672,6 +4491,11 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                         // active. Named rather than counted: a skill's scripts are the part an
                         // operator has to have approved.
                         scripts: skill.scripts.map((plan) => plan.slug),
+                        // Whether those scripts become tools when it is active (pilot.14): false for
+                        // a skill `skills.trusted` does not name, true for every skill when it is absent.
+                        trusted:
+                            agent.manifest.skills?.trusted === undefined ||
+                            agent.manifest.skills.trusted.includes(skill.name),
                     })),
                 })
             }),
@@ -2821,11 +4645,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                                 !reachesAgent(context.principal, event.agentId)
                             )
                                 return
-                            if (
-                                event.sessionKey !== undefined &&
-                                !reachesSession(context.principal, event.sessionKey)
-                            )
-                                return
+                            if (!reachesEventSession(context.principal, event)) return
                             if (
                                 types !== undefined &&
                                 types.length > 0 &&
@@ -2959,6 +4779,13 @@ export function createHandler(options: HandlerOptions): ServerHandler {
             }
         }
 
+        const mounted = pluginRouteFor(method, url.pathname)
+        if (mounted !== undefined) {
+            const crossOrigin = refuseOrigin(request)
+            if (crossOrigin !== undefined) return crossOrigin
+            return withCors(request, await dispatchPlugin(request, url, mounted))
+        }
+
         const match = router.match(method, url.pathname)
         if (match.kind === "method") {
             return fail(
@@ -2971,16 +4798,7 @@ export function createHandler(options: HandlerOptions): ServerHandler {
                 { allow: match.allowed.join(", ") },
             )
         }
-        if (match.kind === "none") {
-            return fail(
-                {
-                    code: "not_found",
-                    message: `No route for ${request.method} ${url.pathname}.`,
-                    hint: "Every path is under /v1. See docs/04-SPEC-WIRE.md for the surface.",
-                },
-                404,
-            )
-        }
+        if (match.kind === "none") return noRoute(request.method, url.pathname)
 
         // **Before the open-path check, not after.** `POST /v1/channels/…` is open by prefix and
         // changes state, so a guard sitting behind authentication would leave the one
@@ -3004,6 +4822,81 @@ export function createHandler(options: HandlerOptions): ServerHandler {
     }
 
     /**
+     * A plugin's route (Phase 30): `/v1/agents/<agentId>/plugins/<plugin>/<path>`, or a root path one
+     * plugin route claims (`/.well-known/agent-card.json`) while exactly one hosted agent claims it.
+     *
+     * Looked up per request from the agents the runtime hosts right now, because a plugin's routes
+     * come and go with the agent — a table built at start would keep answering for an agent that was
+     * stopped, and never learn about one adopted later.
+     */
+    const pluginRouteFor = (
+        method: string,
+        pathname: string,
+    ):
+        | { readonly agent: Agent; readonly route: MountedRoute; readonly path: string }
+        | undefined => {
+        const prefix = /^\/v1\/agents\/([^/]+)\/plugins\/([^/]+)(\/.*)?$/.exec(pathname)
+        if (prefix !== null) {
+            const agent = runtime.list().find((a) => a.id === decodeURIComponent(prefix[1] ?? ""))
+            const plugin = prefix[2] ?? ""
+            const path = prefix[3] ?? "/"
+            const route = agent?.pluginRoutes.find(
+                (r) => r.plugin === plugin && r.method === method && r.path === path,
+            )
+            return agent === undefined || route === undefined ? undefined : { agent, route, path }
+        }
+        const claims = runtime
+            .list()
+            .flatMap((agent) =>
+                agent.pluginRoutes
+                    .filter((route) => route.root === pathname && route.method === method)
+                    .map((route) => ({ agent, route, path: route.path })),
+            )
+        return claims.length === 1 ? claims[0] : undefined
+    }
+
+    /**
+     * The same gate as every first-party route — authenticate, check the declared capability, then
+     * the agent scope, where an agent the key does not reach answers exactly as a missing one — and
+     * only then the plugin, handed a caller rather than a credential.
+     */
+    const dispatchPlugin = async (
+        request: Request,
+        url: URL,
+        mounted: { readonly agent: Agent; readonly route: MountedRoute; readonly path: string },
+    ): Promise<Response> => {
+        const { agent, route, path } = mounted
+        const who: Principal | Response =
+            route.capability === "open"
+                ? { kind: "open" }
+                : await resolve(request, url.pathname, route.capability)
+        if (who instanceof Response) return who
+        // Out of scope answers exactly as a path nothing is mounted at — which is what an agent that
+        // does not exist gets, since it falls through to the router — so no probe tells them apart.
+        if (who.kind === "claim" || !reachesAgent(who, agent.id))
+            return noRoute(request.method, url.pathname)
+        const caller: PluginCaller =
+            who.kind === "key"
+                ? { kind: "key", keyId: who.keyId, label: who.label ?? "" }
+                : route.capability === "open"
+                  ? { kind: "anonymous" }
+                  : { kind: "operator" }
+        try {
+            return await route.handler({ request, url, path, caller })
+        } catch (error) {
+            // A plugin that throws is the plugin's bug; the caller gets a 500 that says whose.
+            return fail(
+                {
+                    code: "plugin_route_failed",
+                    message: `Plugin "${route.plugin}" failed answering ${request.method} ${url.pathname}: ${error instanceof Error ? error.message : String(error)}`,
+                    hint: "This is the plugin's error, not the runtime's. The agent's own routes are unaffected.",
+                },
+                500,
+            )
+        }
+    }
+
+    /**
      * The same resolution, without dispatching — for the WebSocket handshake.
      *
      * `"/v1/ws"` is the pathname it is asked about, and the capability is `read`: a socket only
@@ -3013,6 +4906,12 @@ export function createHandler(options: HandlerOptions): ServerHandler {
      */
     return Object.assign(dispatch, {
         authenticate: (request: Request) => resolve(request, "/v1/ws", "read"),
+        routes: () =>
+            router.routes().map(({ method, pattern, capability }) => ({
+                method,
+                pattern,
+                capability,
+            })),
     })
 }
 
@@ -3078,6 +4977,9 @@ async function writeSchedule(
             body: body as Record<string, unknown>,
             channelIds: agent.manifest.channels.map((channel) => channel.id),
             roleNames: Object.keys(agent.manifest.model),
+            // The resolved catalogue, so a `tools.allow` naming nothing is refused now rather than
+            // running quietly with fewer tools than its author wrote.
+            toolSpecs: agent.tools.specs(),
             now: Date.now(),
             // Never `manifest`: a row written here must survive a reload, and marking it as the
             // manifest's would let the next reconciliation delete something no file describes.
@@ -3221,6 +5123,18 @@ async function runHandler(handler: Handler, context: RequestContext): Promise<Re
  * — advice about channel segments is noise on a turn id, and noise in a hint is what teaches people
  * to stop reading them.
  */
+/** Nothing answers at this path. One body for every such case, so a probe learns nothing from it. */
+function noRoute(method: string, pathname: string): Response {
+    return fail(
+        {
+            code: "not_found",
+            message: `No route for ${method} ${pathname}.`,
+            hint: "Every path is under /v1. See docs/04-SPEC-WIRE.md for the surface.",
+        },
+        404,
+    )
+}
+
 function notFound(kind: string, id: string, hint?: string): Response {
     return fail(
         {
@@ -3378,6 +5292,54 @@ function usageQuery(
     return { kind: "ok", value: { by: by as UsageGroup[], ...range } }
 }
 
+/** A stopped agent as the listing and its resource both show it: thin, because nothing is loaded. */
+function stoppedRow(state: AgentStateRecord) {
+    return {
+        id: state.agentId,
+        name: state.agentId,
+        status: "disabled" as const,
+        ...(state.reason === undefined ? {} : { reason: state.reason }),
+        ...(state.disabledAt === undefined ? {} : { disabledAt: state.disabledAt }),
+    }
+}
+
+/**
+ * The agent a file route acts on (pilot.15): one this process hosts, or one on disk it is not running,
+ * found through `resolveAgent` as `start` finds it. An agent that failed to load answered 404 on every
+ * route, so nothing over the API could repair it; its files are still files. Same scope check and the
+ * same 404 as `withAgent` for anything out of reach or imaginary.
+ */
+function withTarget(
+    runtime: Runtime,
+    options: HandlerOptions,
+    context: RequestContext,
+    work: (target: {
+        readonly id: string
+        readonly file: string | undefined
+        readonly agent: Agent | undefined
+    }) => Promise<Response> | Response,
+): Promise<Response> | Response {
+    const id = context.params.id ?? ""
+    if (!reachesAgent(context.principal, id)) return notFound("agent", id)
+    const agent = runtime.list().find((candidate) => candidate.id === id)
+    if (agent !== undefined) {
+        const source = runtime.sourceOf(id)
+        return work({ id, agent, file: typeof source === "string" ? source : undefined })
+    }
+    const file = options.resolveAgent?.(id)
+    if (file === undefined) return notFound("agent", id)
+    return work({ id, agent: undefined, file })
+}
+
+/** The `pending` for a write to an agent that is not running: in force once it starts. */
+function notRunning(id: string): ErrorDetail {
+    return {
+        code: "agent_not_running",
+        message: `${id} is not running, so the change is on disk and not yet in force.`,
+        hint: `POST /v1/agents/${id}/start loads it from the files as they are now. GET /v1/agents/${id} says whether they load.`,
+    }
+}
+
 function withAgent(
     runtime: Runtime,
     context: RequestContext,
@@ -3446,6 +5408,122 @@ function outsideSession(context: RequestContext, sessionKey: string): Response |
 }
 
 /**
+ * Whether a turn is out of this caller's reach, for the routes addressed by turn id.
+ *
+ * A turn belongs to a session, so a key narrowed to some sessions reaches only their turns. A live
+ * turn can be streaming a moment before its row is written; for a scoped caller that turn is out of
+ * reach until the row says whose it is, which is the fail-closed direction.
+ */
+function outsideTurn(
+    context: RequestContext,
+    record: { readonly sessionKey: string } | undefined,
+): boolean {
+    if (record === undefined) return isScoped(context.principal)
+    return !reachesSession(context.principal, record.sessionKey)
+}
+
+/** `GET /config`'s rows for the named model roles the source declares, `main` excepted. */
+function declaredRoles(
+    text: string | undefined,
+): { readonly path: string; readonly means: string; readonly value: unknown }[] {
+    if (text === undefined) return []
+    const model = manifestValueAt(text, ["model"])
+    if (model === null || typeof model !== "object" || Array.isArray(model)) return []
+    const means = settingByPath("model.<role>")?.means ?? "a named model role"
+    return Object.entries(model as Record<string, unknown>)
+        .filter(([name]) => name !== "main")
+        .map(([name, value]) => ({ path: `model.${name}`, means, value }))
+}
+
+/** One declared workspace file, with where it came from. The soul files carry their own tier. */
+interface DeclaredFile {
+    readonly path: string
+    readonly tier: string
+    readonly field: string
+}
+
+/**
+ * The files an agent's manifest declares, read from the file on disk. Shared by the workspace
+ * routes so a listing, a read and a write agree about what exists; a manifest that does not parse
+ * is the same `409` on all three.
+ */
+async function declaredWorkspace(
+    agentId: string,
+    manifest: string,
+): Promise<
+    { readonly workspaceDir: string; readonly declared: readonly DeclaredFile[] } | Response
+> {
+    const read = AgentManifestSchema.safeParse(manifestDocument(await readFile(manifest, "utf8")))
+    if (!read.success) {
+        return fail(
+            {
+                code: "workspace_manifest_invalid",
+                message: `${agentId}'s manifest does not parse, so its workspace files cannot be named.`,
+                hint: "Fix the manifest first: PATCH /v1/agents/:id/config, and GET /v1/agents/:id for what is wrong.",
+            },
+            409,
+        )
+    }
+    const dir = dirname(manifest)
+    const contextConfig = read.data.context
+    const workspaceDir = resolvePath(dir, contextConfig.workspace)
+    const soul = contextConfig.soul
+    const declared: DeclaredFile[] = [
+        ...planWorkspace(contextConfig, dir).refs.map((ref) => ({
+            path: ref.path,
+            tier: ref.tier,
+            field: ref.field,
+        })),
+        ...(soul?.file === undefined
+            ? []
+            : [
+                  {
+                      path: resolvePath(workspaceDir, soul.file),
+                      tier: "soul",
+                      field: "context.soul.file",
+                  },
+              ]),
+        ...(soul?.distilled === undefined
+            ? []
+            : [
+                  {
+                      path: resolvePath(workspaceDir, soul.distilled),
+                      tier: "soul",
+                      field: "context.soul.distilled",
+                  },
+              ]),
+    ]
+    return { workspaceDir, declared }
+}
+
+function findDeclared(
+    declared: readonly DeclaredFile[],
+    workspaceDir: string,
+    name: string,
+): string | undefined {
+    return declared.find(
+        (candidate) =>
+            candidate.path === resolvePath(workspaceDir, name) || basename(candidate.path) === name,
+    )?.path
+}
+
+function unknownWorkspaceFile(
+    agentId: string,
+    name: string,
+    declared: readonly DeclaredFile[],
+): Response {
+    return fail(
+        {
+            code: "workspace_file_unknown",
+            message: `${name} is not one of ${agentId}'s workspace files.`,
+            hint: `Declared: ${declared.map((candidate) => basename(candidate.path)).join(", ") || "none"}. A new file is added to context.static or context.volatile with PATCH /config first.`,
+            field: "file",
+        },
+        404,
+    )
+}
+
+/**
  * The shared shape of an agent in the listing and at the head of its detail.
  *
  * **There is no current phase here, and the field is named to say so.** It was `phase: null` for
@@ -3465,6 +5543,11 @@ function summary(runtime: Runtime, agent: Agent) {
     return {
         id: agent.id,
         name: agent.manifest.name ?? agent.id,
+        ...(agent.manifest.description === undefined
+            ? {}
+            : { description: agent.manifest.description }),
+        // Whether it takes part in `ask_agent` (`24-SPEC-PEER-ASK.md`).
+        ask: agent.manifest.delegation?.ask === true,
         status: "loaded",
         model: agent.manifest.model.main.id,
         // Runtime status **layered over the manifest**, because a panel that offers "connect" needs
@@ -3500,6 +5583,9 @@ function summary(runtime: Runtime, agent: Agent) {
         }),
         entryPhase: phased ? (entryPhase(phases) ?? null) : null,
         ...(phased ? { phases: Object.keys(phases) } : {}),
+        // How this agent chooses a turn's conversation, so a client knows whether "new conversation"
+        // is a rotation (`docs/23-SPEC-SESSIONS.md`) or a fresh key of its own.
+        sessionScope: agent.manifest.sessions?.scope ?? "channel-peer",
     }
 }
 
@@ -3519,28 +5605,29 @@ function stateFields(state: AgentStateRecord): Record<string, string> {
 
 async function readJson(
     request: Request,
+    limit = MAX_BODY_BYTES,
 ): Promise<{ kind: "ok"; value: unknown } | { kind: "error"; error: ErrorDetail }> {
     // Checked before reading, so a declared 500 MB body is refused rather than buffered. A body
     // with no content-length is still bounded by the read below.
     const declared = Number.parseInt(request.headers.get("content-length") ?? "0", 10)
-    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    if (Number.isFinite(declared) && declared > limit) {
         return {
             kind: "error",
             error: {
                 code: "body_too_large",
-                message: `The request body declares ${declared} bytes; the limit is ${MAX_BODY_BYTES}.`,
+                message: `The request body declares ${declared} bytes; the limit is ${limit}.`,
                 hint: "This cap is enforced before a channel plugin sees anything, so a plugin never has to defend against a large POST.",
             },
         }
     }
 
     const raw = await request.text()
-    if (raw.length > MAX_BODY_BYTES) {
+    if (raw.length > limit) {
         return {
             kind: "error",
             error: {
                 code: "body_too_large",
-                message: `The request body is ${raw.length} bytes; the limit is ${MAX_BODY_BYTES}.`,
+                message: `The request body is ${raw.length} bytes; the limit is ${limit}.`,
                 hint: "Send less. A message longer than this is not a message.",
             },
         }
@@ -3549,7 +5636,7 @@ async function readJson(
 
     try {
         return { kind: "ok", value: JSON.parse(raw) }
-    } catch (cause) {
+    } catch {
         return {
             kind: "error",
             error: {
@@ -3766,7 +5853,7 @@ function finishedStream(record: TurnRecord): Response {
 function streamTurn(
     runtime: Runtime,
     turnId: string,
-    extra?: { accepted?: unknown; status?: number; chunks?: boolean },
+    extra?: { accepted?: unknown; status?: number; chunks?: boolean; children?: boolean },
 ): Response {
     return sseResponse({
         ...(extra?.status === undefined ? {} : { status: extra.status }),
@@ -3783,9 +5870,10 @@ function streamTurn(
                 turnId,
                 (event: AnyEvent) => {
                     send({ event: event.type, data: event })
-                    if (event.type === "turn.end") close()
+                    // Its own end only: with `children`, a subagent's `turn.end` arrives here too.
+                    if (event.type === "turn.end" && event.turnId === turnId) close()
                 },
-                { chunks: extra?.chunks === true },
+                { chunks: extra?.chunks === true, children: extra?.children === true },
             )
 
             if (attachment === undefined) {
@@ -3835,4 +5923,97 @@ function streamTurn(
             return () => attachment.unsubscribe()
         },
     })
+}
+
+/**
+ * Reload every other hosted agent whose `delegation.to` can name `id`, so its roster shows the new
+ * offer. `now` false (this agent's own reload is still pending) names them unreloaded instead: their
+ * roster is read from the running manifest, so reloading them first would render the old offer.
+ */
+async function reloadAskers(
+    runtime: Runtime,
+    id: string,
+    now: boolean,
+): Promise<{ readonly id: string; readonly applied: boolean; readonly pending?: ErrorDetail }[]> {
+    const askers = runtime.list().filter((other) => {
+        const to = other.manifest.delegation?.to
+        return other.id !== id && (to === "*" || (to?.includes(id) ?? false))
+    })
+    const results = []
+    for (const other of askers) {
+        if (!now) {
+            results.push({
+                id: other.id,
+                applied: false,
+                pending: {
+                    code: "reload_pending",
+                    message: `${id}'s own reload is waiting for running turns, so ${other.id} still lists its old offer.`,
+                    hint: `POST /v1/agents/${other.id}/reload once ${id}'s agent.reloaded event arrives.`,
+                },
+            })
+            continue
+        }
+        try {
+            const pending = pendingDetail(await runtime.reload(other.id))
+            results.push(
+                pending === undefined
+                    ? { id: other.id, applied: true }
+                    : { id: other.id, applied: false, pending },
+            )
+        } catch (error) {
+            if (!isHarnessError(error)) throw error
+            results.push({ id: other.id, applied: false, pending: error.toDetail() })
+        }
+    }
+    return results
+}
+
+/**
+ * A reload waiting for running turns, as the `pending` a write reports: the file is written and
+ * the change is accepted, and it is in force once those turns finish — not "at the next start".
+ */
+function pendingDetail(outcome: ReloadOutcome): ErrorDetail | undefined {
+    if (outcome.status !== "pending") return undefined
+    return {
+        code: "reload_pending",
+        message: `It applies when the ${outcome.running} running turn(s) finish; they complete on the settings they started with.`,
+        hint: `New turns keep the old settings for ${outcome.holdAfterMs} ms, then wait and start on the new ones. The agent.reloaded event says when it is in force.`,
+    }
+}
+
+/** Left out of a backup: secrets the embedder owns, and what is rebuilt rather than restored. */
+const BACKUP_SKIP: ReadonlySet<string> = new Set([
+    ".env",
+    // The sandbox's host token, reached only by `include=home`: a secret, so it follows `env`.
+    ".api-token",
+    ".venv",
+    "node_modules",
+    ".git",
+])
+
+/** What `?include=` may put back, by the name it is asked for. */
+const BACKUP_INCLUDE: Readonly<Record<string, readonly string[]>> = {
+    env: [".env", ".api-token"],
+    git: [".git"],
+}
+
+/** Every regular file under an agent's directory, by its path relative to it, skips excluded. */
+async function agentFiles(
+    root: string,
+    skip: ReadonlySet<string>,
+    prune: ReadonlySet<string> = new Set(),
+): Promise<{ name: string; path: string }[]> {
+    const found: { name: string; path: string }[] = []
+    const walk = async (dir: string) => {
+        for (const entry of await readdir(dir, { withFileTypes: true })) {
+            if (skip.has(entry.name)) continue
+            const path = join(dir, entry.name)
+            if (prune.has(resolvePath(path))) continue
+            if (entry.isDirectory()) await walk(path)
+            else if (entry.isFile())
+                found.push({ name: relative(root, path).split(sep).join("/"), path })
+        }
+    }
+    await walk(root)
+    return found
 }

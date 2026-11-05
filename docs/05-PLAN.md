@@ -3566,7 +3566,9 @@ is told rather than charged, and `--yes` is the scripted way through.
 
 - **`/compact`.** Considered and rejected: the ladder already fires at 60% per step so there is no
   cliff to pre-empt, and compaction rewrites the prompt and never the store, so a manual trigger
-  would have nothing durable to do. Do not add it back without revisiting that.
+  would have nothing durable to do. Do not add it back without revisiting that. **Revisited in 0.2.3
+  (decision 15.21):** a session checkpoint is the durable thing, and `POST …/sessions/:key/compact`
+  writes one; the TUI command is still not built.
 - Provenance for capability fields other than `contextWindow`. Every field in a registry row has the
   same problem; the window is the one a budget divides by.
 
@@ -5358,3 +5360,20 @@ and moving it, read what happens at the destination when the check fails.
 `packages/cli/test/serve.test.ts` is the public API's first in-tree consumer — a two-field plugin
 defining one channel, loaded by the real binary — and it asserts the other direction too, that a
 nonsense type is still refused where the skip loop can see it. Both were revert-checked.
+
+### Hard rule 3 is only enforced in two packages — **open, after 0.2.0**
+
+*Recorded 2026-10-20 while preparing 0.2.0.* The guard "no source file spells the product name"
+(`packages/cli/test/boundaries.test.ts`) read `packages/cli/src` alone; `packages/web/src` joined it
+in 0.2.0. Run over every package it finds about 180 occurrences in 44 more files. Three kinds:
+
+- **Literals that can derive from `BRAND`**: error hints naming a CLI command, the plugin loader's
+  messages, `version.ts`, the control plane's `brand.ts`. Mechanical.
+- **Comments.** Mechanical, and `rename-brand.ts` rewrites them as text anyway.
+- **Public API names**: the `dispachApi` plugin field and `DispachClient`/`DispachError` from the
+  client. Renaming these is a breaking change to the plugin API and the client, so it needs a
+  decision (a neutral name with the old one kept as a deprecated alias, or an allowlist in the
+  guard), not a sweep.
+
+`rename-brand.ts` rewrites file contents across the tree, so a rename still works today. What is
+missing is the guard that keeps it a one-commit operation.

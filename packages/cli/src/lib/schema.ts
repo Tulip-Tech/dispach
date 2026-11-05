@@ -278,6 +278,8 @@ export interface ValidateOptions {
 
 export interface InitOptions {
     readonly dir?: string
+    /** AWS region, for `--preset bedrock`. */
+    readonly region?: string
     readonly user?: string
     readonly name?: string
     readonly purpose?: string
@@ -309,6 +311,8 @@ export interface InitOptions {
     /** Take every default; never ask, even at a terminal. */
     readonly yes?: boolean
     readonly plain?: boolean
+    /** Ask the endpoint for the model's window even when not interactive (decision 14.124). */
+    readonly measureWindow?: boolean
     /**
      * How to start the background server when the answer is `service`. Injected by the entry point
      * (`installServerUnit`); absent in tests and for a caller that must not install anything, in

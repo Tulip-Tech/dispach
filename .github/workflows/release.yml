@@ -5,7 +5,8 @@ name: release
 # pushes `v<version>`. This workflow turns that tag into artefacts and publishes nothing on its own.
 #
 # Order: npm first, because the formula's URL and digest are of the tarball the registry serves;
-# then the GitHub Release (notes from CHANGELOG.md), the tap commit and the image, in parallel.
+# then the GitHub Release (notes from CHANGELOG.md), the tap commit, the standalone archives and the
+# image, in parallel.
 on:
   push:
     tags: ["v*"]
@@ -152,7 +153,7 @@ jobs:
     needs: npm
     if: startsWith(github.ref, 'refs/tags/v') && needs.npm.outputs.prerelease != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -167,11 +168,13 @@ jobs:
       - name: download the published tarball
         run: |
           version="${{ needs.npm.outputs.version }}"
-          for _ in $(seq 1 30); do
+          # npm acknowledges a publish before the version resolves ("being processed"), and 0.2.0
+          # took longer than five minutes, so this waits up to thirty.
+          for _ in $(seq 1 90); do
             url=$(npm view "dispach@${version}" dist.tarball 2>/dev/null) && [ -n "$url" ] && break
-            sleep 10
+            sleep 20
           done
-          [ -n "$url" ] || { echo "::error::dispach@${version} is not on the registry yet"; exit 1; }
+          [ -n "$url" ] || { echo "::error::dispach@${version} is not on the registry after 30 minutes"; exit 1; }
           echo "$url"
           curl -fsSL "$url" -o dispach.tgz
           sha256sum dispach.tgz | cut -d' ' -f1 > dispach.sha256
@@ -215,6 +218,96 @@ jobs:
           fi
 
   # ─────────────────────────────────────────────────────────────────────────────────────────
+  # The standalone builds: Node 24 plus the published tarball, one archive per platform, and the
+  # `install.sh` that fetches them (`curl -fsSL …/releases/latest/download/install.sh | sh`).
+  #
+  # Built from the bytes the registry serves, like the formula, so all three installs carry the same
+  # package. A manual run packs the checkout instead and publishes nothing — it proves the build and
+  # both installs. The archives are uploaded only after the installer has worked on Linux and macOS,
+  # because `latest/download` serves whatever is attached the moment it is attached.
+  standalone:
+    needs: npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+
+      - name: the published tarball
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="${{ needs.npm.outputs.version }}"
+          for _ in $(seq 1 90); do
+            url=$(npm view "dispach@${version}" dist.tarball 2>/dev/null) && [ -n "$url" ] && break
+            sleep 20
+          done
+          [ -n "$url" ] || { echo "::error::dispach@${version} is not on the registry after 30 minutes"; exit 1; }
+          curl -fsSL "$url" -o "$RUNNER_TEMP/dispach.tgz"
+
+      - name: build
+        run: |
+          if [ -f "$RUNNER_TEMP/dispach.tgz" ]; then
+            bun scripts/build-standalone.ts --tarball "$RUNNER_TEMP/dispach.tgz"
+          else
+            bun scripts/build-standalone.ts
+          fi
+          cp scripts/install.sh dist-standalone/
+          cat dist-standalone/SHA256SUMS
+
+      # The installer, run the way a person runs it, against these archives rather than a release.
+      - name: install on linux
+        run: |
+          (cd dist-standalone && python3 -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 1
+          DISPACH_DOWNLOAD_BASE=http://127.0.0.1:8765 sh dist-standalone/install.sh
+          test "$("$HOME/.dispach/bin/dispach" --version)" = "${{ needs.npm.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: standalone
+          path: dist-standalone/
+          retention-days: 7
+
+  standalone-macos:
+    needs: [npm, standalone]
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone
+          path: dist-standalone
+      - name: install on macos
+        run: |
+          (cd dist-standalone && python3 -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 1
+          DISPACH_DOWNLOAD_BASE=http://127.0.0.1:8765 sh dist-standalone/install.sh
+          test "$("$HOME/.dispach/bin/dispach" --version)" = "${{ needs.npm.outputs.version }}"
+
+  standalone-publish:
+    needs: [npm, release, standalone, standalone-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone
+          path: dist-standalone
+      - name: attach to the release
+        run: gh release upload "${GITHUB_REF_NAME}" dist-standalone/* --clobber --repo "${GITHUB_REPOSITORY}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────────────────
   # The image, to GHCR.
   #
   # Two architectures, because the agent container is as likely to land on an arm64 host as an
@@ -252,6 +345,20 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}},enable=${{ needs.npm.outputs.prerelease != 'true' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && needs.npm.outputs.prerelease != 'true' }}
+            type=raw,value=${{ needs.npm.outputs.version }},enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+      # A run from a branch proves the image builds and pushes nothing: login and push are tag-only.
+      # `type=semver` reads the tag ref, so a branch run had no tag at all, and its "No Docker tag has
+      # been generated" read as a release that went wrong (VelaCrew, pilot.4). The raw tag above names
+      # the build, and this line says what the run did.
+      - name: what this run publishes
+        run: |
+          if [ "${GITHUB_REF#refs/tags/v}" != "${GITHUB_REF}" ]; then
+            echo "pushing: ${{ steps.meta.outputs.tags }}" | tr '\n' ' '
+          else
+            echo "build only, nothing pushed: run this workflow from the v${{ needs.npm.outputs.version }} tag to publish the image" >> "$GITHUB_STEP_SUMMARY"
+            echo "build only, nothing pushed (${GITHUB_REF})"
+          fi
 
       - uses: docker/build-push-action@v6
         with:
